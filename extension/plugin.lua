@@ -47,8 +47,13 @@ _G.MCP_BASE64 = {
 
 -- Configuration
 local DEFAULT_PORT = 6515
+local PORT_MIN = 6515
+local PORT_MAX = 6519
 local RECONNECT_INTERVAL_MS = 3000
-local VERSION = "1.0.0"
+-- If no message (incl. server pings) arrives within this window, treat the
+-- connection as dead and force a reconnect even if no CLOSE/ERROR event fired.
+local STALE_SECONDS = 20
+local VERSION = "1.2.0"
 
 -- State
 local ws = nil
@@ -56,6 +61,7 @@ local connected = false
 local handlers = {}
 local reconnect_timer = nil
 local port = DEFAULT_PORT
+local last_activity = 0
 
 ----------------------------------------------------------------------
 -- JSON (Aseprite built-in)
@@ -148,6 +154,54 @@ function color_util.color_to_pixel(color, color_mode, palette)
     return 0
   end
   return 0
+end
+
+----------------------------------------------------------------------
+-- Utility: Enum name mapping (tostring(enum) yields the raw integer, which
+-- cannot be fed back to setters that expect names — return the names instead).
+----------------------------------------------------------------------
+local enum_util = {}
+
+function enum_util.color_mode_name(mode)
+  if mode == ColorMode.RGB then return "rgba" end
+  if mode == ColorMode.GRAYSCALE then return "grayscale" end
+  if mode == ColorMode.INDEXED then return "indexed" end
+  if mode == ColorMode.TILEMAP then return "tilemap" end
+  return "rgba"
+end
+
+function enum_util.blend_mode_name(mode)
+  if mode == nil then return "normal" end
+  local names = {
+    [BlendMode.NORMAL] = "normal",
+    [BlendMode.MULTIPLY] = "multiply",
+    [BlendMode.SCREEN] = "screen",
+    [BlendMode.OVERLAY] = "overlay",
+    [BlendMode.DARKEN] = "darken",
+    [BlendMode.LIGHTEN] = "lighten",
+    [BlendMode.COLOR_DODGE] = "color_dodge",
+    [BlendMode.COLOR_BURN] = "color_burn",
+    [BlendMode.HARD_LIGHT] = "hard_light",
+    [BlendMode.SOFT_LIGHT] = "soft_light",
+    [BlendMode.DIFFERENCE] = "difference",
+    [BlendMode.EXCLUSION] = "exclusion",
+    [BlendMode.HSL_HUE] = "hsl_hue",
+    [BlendMode.HSL_SATURATION] = "hsl_saturation",
+    [BlendMode.HSL_COLOR] = "hsl_color",
+    [BlendMode.HSL_LUMINOSITY] = "hsl_luminosity",
+    [BlendMode.ADDITION] = "addition",
+    [BlendMode.SUBTRACT] = "subtract",
+    [BlendMode.DIVIDE] = "divide",
+  }
+  return names[mode] or "normal"
+end
+
+function enum_util.ani_dir_name(dir)
+  if dir == AniDir.FORWARD then return "forward" end
+  if dir == AniDir.REVERSE then return "reverse" end
+  if dir == AniDir.PING_PONG then return "ping_pong" end
+  if dir == AniDir.PING_PONG_REVERSE then return "ping_pong_reverse" end
+  return "forward"
 end
 
 ----------------------------------------------------------------------
@@ -312,6 +366,55 @@ function base.transaction(name, fn)
   app.transaction(name, fn)
 end
 
+-- Aseprite's json.decode returns userdata (JsonObj/JsonArr), NOT Lua tables.
+-- A `type(x) ~= "table"` guard therefore rejects every valid decoded array.
+-- Accept both tables and array-like userdata.
+-- Normalize a save/export path to what Aseprite actually uses on this platform
+-- and confirm the file exists. On Windows a POSIX path like /tmp/x.png is
+-- silently rewritten to a drive-relative C:\tmp\x.png, so echoing the input
+-- string hides where the file really went.
+function base.resolve_saved_path(path)
+  local norm = app.fs.normalizePath(path)
+  return norm, app.fs.isFile(norm)
+end
+
+function base.is_array(v)
+  if v == nil then return false end
+  local t = type(v)
+  if t ~= "table" and t ~= "userdata" then return false end
+  local ok, n = pcall(function() return #v end)
+  return ok and n ~= nil
+end
+
+-- JSON numbers decode as floats (1.0). Coerce to an integer for APIs that
+-- require one (frame indices, tile indices, pixel coords, palette indices).
+function base.to_int(v, default_val)
+  if v == nil then return default_val end
+  if type(v) == "number" then return math.floor(v + 0.5) end
+  local n = tonumber(v)
+  if n == nil then return default_val end
+  return math.floor(n + 0.5)
+end
+
+-- Write a text file, creating the parent directory first. io.open returns nil
+-- when the directory is missing, so the naive `if f then ... end` pattern
+-- reports success for files that were never created. Returns ok, err.
+function base.write_text_file(path, content)
+  local dir = app.fs.filePath(path)
+  if dir and dir ~= "" and not app.fs.isDirectory(dir) then
+    app.fs.makeAllDirectories(dir)
+  end
+  local f = io.open(path, "w")
+  if not f then
+    return false, base.error(-32603,
+      "Failed to write file (could not open for writing): " .. tostring(path),
+      { path = path })
+  end
+  f:write(content)
+  f:close()
+  return true, nil
+end
+
 ----------------------------------------------------------------------
 -- Sprite Commands
 ----------------------------------------------------------------------
@@ -337,7 +440,7 @@ function sprite_cmds.create_sprite(params)
   return base.success({
     width = sprite.width,
     height = sprite.height,
-    color_mode = tostring(sprite.colorMode),
+    color_mode = enum_util.color_mode_name(sprite.colorMode),
     filename = sprite.filename,
     layers = #sprite.layers,
     frames = #sprite.frames,
@@ -356,7 +459,7 @@ function sprite_cmds.open_sprite(params)
   return base.success({
     width = sprite.width,
     height = sprite.height,
-    color_mode = tostring(sprite.colorMode),
+    color_mode = enum_util.color_mode_name(sprite.colorMode),
     filename = sprite.filename,
     layers = #sprite.layers,
     frames = #sprite.frames,
@@ -368,12 +471,29 @@ function sprite_cmds.save_sprite(params)
   if err then return err end
 
   local path = base.optional_string(params, "path", nil)
+  -- When true, adopt the new filename (real Save As) so the sprite is no longer
+  -- the ambiguous "Sprite"; default keeps the historical save-copy behaviour.
+  local rename = base.optional_bool(params, "rename", false)
   if path then
-    sprite:saveCopyAs(path)
-    return base.success({ filename = path, saved_as_copy = true })
+    if app.fs.filePath(path) ~= "" and not app.fs.isDirectory(app.fs.filePath(path)) then
+      app.fs.makeAllDirectories(app.fs.filePath(path))
+    end
+    if rename then
+      sprite:saveAs(path)
+    else
+      sprite:saveCopyAs(path)
+    end
+    local resolved, exists = base.resolve_saved_path(path)
+    return base.success({
+      filename = resolved,
+      requested_path = path,
+      exists = exists,
+      saved_as_copy = not rename,
+    })
   elseif sprite.filename and sprite.filename ~= "" and sprite.filename ~= "Sprite" then
     sprite:saveAs(sprite.filename)
-    return base.success({ filename = sprite.filename })
+    local resolved, exists = base.resolve_saved_path(sprite.filename)
+    return base.success({ filename = resolved, exists = exists })
   else
     return base.error_invalid_params(
       "Sprite has no filename. Please provide a 'path' parameter to save to.")
@@ -414,7 +534,7 @@ function sprite_cmds.get_sprite_info(params)
       type = layer.isGroup and "group" or (layer.isTilemap and "tilemap" or "normal"),
       visible = layer.isVisible,
       opacity = layer.opacity,
-      blend_mode = tostring(layer.blendMode),
+      blend_mode = enum_util.blend_mode_name(layer.blendMode),
     }
   end
 
@@ -424,7 +544,7 @@ function sprite_cmds.get_sprite_info(params)
       name = tag.name,
       from_frame = tag.fromFrame.frameNumber,
       to_frame = tag.toFrame.frameNumber,
-      ani_dir = tostring(tag.aniDir),
+      ani_dir = enum_util.ani_dir_name(tag.aniDir),
     }
   end
 
@@ -432,7 +552,7 @@ function sprite_cmds.get_sprite_info(params)
     filename = sprite.filename,
     width = sprite.width,
     height = sprite.height,
-    color_mode = tostring(sprite.colorMode),
+    color_mode = enum_util.color_mode_name(sprite.colorMode),
     frame_count = #sprite.frames,
     layer_count = #sprite.layers,
     tag_count = #sprite.tags,
@@ -599,7 +719,7 @@ local function layer_info(layer, depth)
     type = layer.isGroup and "group" or (layer.isTilemap and "tilemap" or "normal"),
     visible = layer.isVisible,
     opacity = layer.opacity,
-    blend_mode = tostring(layer.blendMode),
+    blend_mode = enum_util.blend_mode_name(layer.blendMode),
     stack_index = layer.stackIndex,
     depth = depth,
     is_editable = layer.isEditable,
@@ -638,19 +758,39 @@ function layer_cmds.add_layer(params)
 
   local name = base.optional_string(params, "name", nil)
   local layer_type = base.optional_string(params, "type", "normal")
+  local parent_name = base.optional_string(params, "parent", nil)
+  local below_name = base.optional_string(params, "below", nil)
+
+  local parent_layer = nil
+  if parent_name then
+    parent_layer = base.find_layer(sprite, parent_name)
+    if not parent_layer or not parent_layer.isGroup then
+      return base.error_invalid_params("Parent group not found or not a group: " .. parent_name)
+    end
+  end
 
   local layer
   app.transaction("Add Layer", function()
     if layer_type == "group" then
       layer = sprite:newGroup()
     elseif layer_type == "tilemap" then
-      layer = sprite:newLayer()
+      -- sprite:newLayer() cannot create a tilemap layer; the NewLayer command
+      -- can. The created layer becomes app.layer.
+      app.command.NewLayer { tilemap = true }
+      layer = app.layer
     else
       layer = sprite:newLayer()
     end
 
-    if name and layer then
-      layer.name = name
+    if layer then
+      if name then layer.name = name end
+      if parent_layer then layer.parent = parent_layer end
+      if below_name then
+        local ref = base.find_layer(sprite, below_name)
+        if ref and ref.parent == layer.parent then
+          layer.stackIndex = ref.stackIndex
+        end
+      end
     end
   end)
 
@@ -658,10 +798,19 @@ function layer_cmds.add_layer(params)
     return base.error(-32603, "Failed to create layer")
   end
 
+  local reported_type = "normal"
+  if layer.isGroup then
+    reported_type = "group"
+  elseif layer.isTilemap then
+    reported_type = "tilemap"
+  end
+
   return base.success({
     name = layer.name,
-    type = layer_type,
+    type = reported_type,
+    is_tilemap = layer.isTilemap or false,
     stack_index = layer.stackIndex,
+    parent = (layer.parent and layer.parent ~= sprite) and layer.parent.name or nil,
   })
 end
 
@@ -892,8 +1041,8 @@ function frame_cmds.add_frame(params)
     if not copy and new_frame then
       for _, layer in ipairs(sprite.layers) do
         if not layer.isGroup then
-          local cel = sprite:cel(layer, new_frame)
-          if cel then
+          local ok, cel = pcall(function() return sprite:cel(layer, new_frame) end)
+          if ok and cel then
             sprite:deleteCel(cel)
           end
         end
@@ -901,8 +1050,10 @@ function frame_cmds.add_frame(params)
     end
   end)
 
+  -- Sprite:newFrame() returns a handle whose frameNumber reports the REFERENCE
+  -- frame, not the created one. app.frame is the newly created frame.
   return base.success({
-    frame = new_frame and new_frame.frameNumber or 0,
+    frame = app.frame and app.frame.frameNumber or #sprite.frames,
     total_frames = #sprite.frames,
   })
 end
@@ -1006,14 +1157,15 @@ function frame_cmds.duplicate_frame(params)
   local frame_num = base.optional_number(params, "frame", nil)
   local source_frame = frame_num and sprite.frames[frame_num] or app.frame
 
-  local new_frame
+  local src_number = source_frame.frameNumber
   app.transaction("Duplicate Frame", function()
-    new_frame = sprite:newFrame(source_frame)
+    sprite:newFrame(source_frame)
   end)
 
+  -- newFrame() returns the reference frame's number; app.frame is the new one.
   return base.success({
-    source_frame = source_frame.frameNumber,
-    new_frame = new_frame and new_frame.frameNumber or 0,
+    source_frame = src_number,
+    new_frame = app.frame and app.frame.frameNumber or #sprite.frames,
     total_frames = #sprite.frames,
   })
 end
@@ -1027,11 +1179,48 @@ function frame_cmds.reverse_frames(params)
   local to, err3 = base.require_number(params, "to_frame")
   if err3 then return err3 end
 
-  app.range.frames = {}
-  for i = from, to do
-    app.range.frames[#app.range.frames + 1] = sprite.frames[i]
+  from = base.to_int(from)
+  to = base.to_int(to)
+  if from > to then from, to = to, from end
+  from = math.max(1, from)
+  to = math.min(#sprite.frames, to)
+  if to <= from then
+    return base.error_invalid_params("Need at least 2 frames in range to reverse")
   end
-  app.command.ReverseFrames()
+
+  -- Implemented against the Sprite API directly: app.range + app.command is
+  -- unreliable headless (the range selection does not stick), and index-
+  -- assigning into app.range.frames raises a __setters error.
+  app.transaction("Reverse Frames", function()
+    -- Snapshot every cel and frame duration in the range.
+    local snap = {}
+    local durations = {}
+    for i = from, to do
+      snap[i] = {}
+      durations[i] = sprite.frames[i].duration
+      for li, lay in ipairs(sprite.layers) do
+        local c = lay:cel(i)
+        if c then
+          snap[i][li] = { image = c.image:clone(), pos = c.position, opacity = c.opacity }
+        end
+      end
+    end
+    -- Write them back reversed (cels and durations together).
+    for i = from, to do
+      local src_idx = to - (i - from)
+      local src = snap[src_idx]
+      sprite.frames[i].duration = durations[src_idx]
+      for li, lay in ipairs(sprite.layers) do
+        local d = src[li]
+        if d then
+          local cel = sprite:newCel(lay, i, d.image, d.pos)
+          cel.opacity = d.opacity
+        elseif lay:cel(i) then
+          sprite:deleteCel(lay, i)
+        end
+      end
+    end
+  end)
 
   return base.success({
     from_frame = from,
@@ -1168,20 +1357,57 @@ function cel_cmds.link_cels(params)
   local layer = base.find_layer(sprite, layer_name)
   if not layer then return base.error_layer_not_found(layer_name) end
 
-  app.layer = layer
-  app.range.frames = {}
-  for i = from_frame, to_frame do
-    if i >= 1 and i <= #sprite.frames then
-      app.range.frames[#app.range.frames + 1] = sprite.frames[i]
-    end
+  from_frame = math.max(1, base.to_int(from_frame))
+  to_frame = math.min(#sprite.frames, base.to_int(to_frame))
+  if to_frame <= from_frame then
+    return base.error_invalid_params("Need at least 2 frames in range to link")
   end
-  app.command.LinkCels()
+
+  -- Build the range from a pre-built plain table (index-assigning into
+  -- app.range.frames raises a __setters error), then verify the range actually
+  -- took before issuing the command — headless it often does not.
+  local sel = {}
+  for i = from_frame, to_frame do
+    sel[#sel + 1] = sprite.frames[i]
+  end
+  app.layer = layer
+  app.frame = sprite.frames[from_frame]
+
+  local linked_via_command = false
+  pcall(function()
+    app.range.layers = { layer }
+    app.range.frames = sel
+    if not app.range.isEmpty and #app.range.frames >= 2 then
+      app.command.LinkCels()
+      linked_via_command = true
+    end
+  end)
+
+  -- Fallback: if the range didn't take, share the source frame's content across
+  -- the range so the frames are visually identical (content copy, not an engine
+  -- link).
+  local method = "linked"
+  if not linked_via_command then
+    method = "content_copied"
+    app.transaction("Link Cels (content copy)", function()
+      local src = layer:cel(from_frame)
+      for i = from_frame + 1, to_frame do
+        if src then
+          local cel = sprite:newCel(layer, i, src.image, src.position)
+          cel.opacity = src.opacity
+        elseif layer:cel(i) then
+          sprite:deleteCel(layer, i)
+        end
+      end
+    end)
+  end
 
   return base.success({
     layer = layer_name,
     from_frame = from_frame,
     to_frame = to_frame,
     linked = true,
+    method = method,
   })
 end
 
@@ -1206,6 +1432,25 @@ local function get_target_image(sprite, params)
   return cel, layer, frame, nil
 end
 
+-- Aseprite bounds cels to their content, so after a partial draw the cel image
+-- is smaller than the canvas. Writing outside it is silently dropped. Grow the
+-- cel image (preserving existing content) so it covers the given rectangle.
+local function grow_cel_to_include(sprite, cel, px, py, pw, ph)
+  pw = pw or 1
+  ph = ph or 1
+  local b = Rectangle(cel.position.x, cel.position.y, cel.image.width, cel.image.height)
+  local u = b:union(Rectangle(px, py, pw, ph))
+  if u.x == b.x and u.y == b.y and u.width == b.width and u.height == b.height then
+    return cel
+  end
+  local ni = Image(u.width, u.height, sprite.colorMode)
+  ni:clear()
+  ni:drawImage(cel.image, Point(b.x - u.x, b.y - u.y))
+  cel.image = ni
+  cel.position = Point(u.x, u.y)
+  return cel
+end
+
 function drawing_cmds.put_pixel(params)
   local sprite, err = base.get_sprite()
   if err then return err end
@@ -1220,16 +1465,14 @@ function drawing_cmds.put_pixel(params)
   local cel, _, _, err5 = get_target_image(sprite, params)
   if err5 then return err5 end
 
+  x = base.to_int(x)
+  y = base.to_int(y)
   local color = color_util.from_hex(color_hex)
   local pixel_val = color_util.color_to_pixel(color, sprite.colorMode, sprite.palettes[1])
 
-  local lx = x - cel.position.x
-  local ly = y - cel.position.y
-
   app.transaction("Put Pixel", function()
-    if lx >= 0 and ly >= 0 and lx < cel.image.width and ly < cel.image.height then
-      cel.image:putPixel(lx, ly, pixel_val)
-    end
+    grow_cel_to_include(sprite, cel, x, y, 1, 1)
+    cel.image:putPixel(x - cel.position.x, y - cel.position.y, pixel_val)
   end)
 
   return base.success({ x = x, y = y, color = color_hex })
@@ -1254,25 +1497,48 @@ function drawing_cmds.put_pixels(params)
 
   local palette = sprite.palettes[1]
   local cm = sprite.colorMode
-  local img = cel.image
-  local ox, oy = cel.position.x, cel.position.y
 
+  -- Compute the bounding rectangle of all requested points and grow the cel
+  -- once so no write is silently dropped outside the existing cel bounds.
+  local minx, miny, maxx, maxy
+  for i = 1, pixel_count do
+    local p = pixels[i]
+    if p and p.x and p.y and p.color then
+      local px, py = base.to_int(p.x), base.to_int(p.y)
+      if minx == nil then
+        minx, miny, maxx, maxy = px, py, px, py
+      else
+        if px < minx then minx = px end
+        if py < miny then miny = py end
+        if px > maxx then maxx = px end
+        if py > maxy then maxy = py end
+      end
+    end
+  end
+
+  local set_count = 0
   app.transaction("Put Pixels", function()
+    if minx ~= nil then
+      grow_cel_to_include(sprite, cel, minx, miny, maxx - minx + 1, maxy - miny + 1)
+    end
+    local img = cel.image
+    local ox, oy = cel.position.x, cel.position.y
     for i = 1, pixel_count do
       local p = pixels[i]
       if p and p.x and p.y and p.color then
         local color = color_util.from_hex(p.color)
         local pv = color_util.color_to_pixel(color, cm, palette)
-        local lx = p.x - ox
-        local ly = p.y - oy
+        local lx = base.to_int(p.x) - ox
+        local ly = base.to_int(p.y) - oy
         if lx >= 0 and ly >= 0 and lx < img.width and ly < img.height then
           img:putPixel(lx, ly, pv)
+          set_count = set_count + 1
         end
       end
     end
   end)
 
-  return base.success({ pixels_set = #pixels })
+  return base.success({ pixels_set = set_count })
 end
 
 function drawing_cmds.get_pixel(params)
@@ -1353,14 +1619,56 @@ function drawing_cmds.set_image_data(params)
   local sprite, err = base.get_sprite()
   if err then return err end
 
-  local data, err2 = base.require_string(params, "data")
-  if err2 then return err2 end
-
   local format = base.optional_string(params, "format", "base64_png")
   local layer, err3 = base.get_target_layer(sprite, params)
   if err3 then return err3 end
   local frame, err4 = base.get_target_frame(sprite, params)
   if err4 then return err4 end
+
+  if format == "hex_array" then
+    -- Mirror get_image_data(hex_array): a flat row-major array of hex strings
+    -- plus width/height.
+    local pixels = params.pixels
+    if not base.is_array(pixels) then
+      return base.error_invalid_params("hex_array format requires 'pixels' (array of hex strings)")
+    end
+    local width = base.to_int(base.optional_number(params, "width", nil))
+    local height = base.to_int(base.optional_number(params, "height", nil))
+    if not width or not height or width < 1 or height < 1 then
+      return base.error_invalid_params("hex_array format requires positive 'width' and 'height'")
+    end
+    if #pixels < width * height then
+      return base.error_invalid_params(string.format(
+        "pixels array has %d entries but width*height = %d", #pixels, width * height))
+    end
+
+    local cm = sprite.colorMode
+    local palette = sprite.palettes[1]
+    local img = Image(width, height, cm)
+    img:clear()
+    local idx = 1
+    for y = 0, height - 1 do
+      for x = 0, width - 1 do
+        local hex = pixels[idx]
+        if hex then
+          local c = color_util.from_hex(tostring(hex))
+          img:putPixel(x, y, color_util.color_to_pixel(c, cm, palette))
+        end
+        idx = idx + 1
+      end
+    end
+
+    app.transaction("Set Image Data", function()
+      local cel = layer:cel(frame.frameNumber)
+      if cel then sprite:deleteCel(cel) end
+      sprite:newCel(layer, frame, img, Point(0, 0))
+    end)
+
+    return base.success({ width = width, height = height })
+  end
+
+  local data, err2 = base.require_string(params, "data")
+  if err2 then return err2 end
 
   if format == "base64_png" then
     local b64 = _G.MCP_BASE64
@@ -1386,7 +1694,7 @@ function drawing_cmds.set_image_data(params)
 
     return base.success({ width = img.width, height = img.height })
   else
-    return base.error_invalid_params("hex_array format for set_image_data is not yet supported. Use base64_png.")
+    return base.error_invalid_params("Unknown format: " .. tostring(format) .. ". Use base64_png or hex_array.")
   end
 end
 
@@ -1547,7 +1855,7 @@ function drawing_cmds.draw_brush_stroke(params)
   if err then return err end
 
   local points_data = params.points
-  if not points_data or type(points_data) ~= "table" or #points_data < 1 then
+  if not base.is_array(points_data) or #points_data < 1 then
     return base.error_invalid_params("Missing required parameter: points (array of {x,y})")
   end
 
@@ -1603,14 +1911,21 @@ function drawing_cmds.clear_image(params)
 
   app.transaction("Clear Image", function()
     local cel = layer:cel(frame.frameNumber)
-    if cel then
-      if color_hex then
-        local color = color_util.from_hex(color_hex)
-        local pv = color_util.color_to_pixel(color, sprite.colorMode, sprite.palettes[1])
-        cel.image:clear(pv)
+    if color_hex then
+      -- Fill with a colour: cover the whole canvas, not just the (possibly
+      -- partial) existing cel rectangle.
+      local color = color_util.from_hex(color_hex)
+      local pv = color_util.color_to_pixel(color, sprite.colorMode, sprite.palettes[1])
+      if not cel then
+        local img = Image(sprite.spec)
+        img:clear(pv)
+        cel = sprite:newCel(layer, frame, img, Point(0, 0))
       else
-        cel.image:clear()
+        grow_cel_to_include(sprite, cel, 0, 0, sprite.width, sprite.height)
+        cel.image:clear(pv)
       end
+    elseif cel then
+      cel.image:clear()
     end
   end)
 
@@ -1774,11 +2089,23 @@ end
 ----------------------------------------------------------------------
 local selection_cmds = {}
 
-local function selection_mode_value(mode_str)
-  if mode_str == "add" then return SelectionMode.ADD end
-  if mode_str == "subtract" then return SelectionMode.SUBTRACT end
-  if mode_str == "intersect" then return SelectionMode.INTERSECT end
-  return SelectionMode.REPLACE
+-- Apply a new Selection to the sprite honouring the requested combine mode.
+-- Aseprite's SelectionMode enum is not applied by :select(); combine explicitly.
+local function apply_selection(sprite, new_sel, mode)
+  if mode == "add" or mode == "subtract" or mode == "intersect" then
+    local result = Selection()
+    result:add(sprite.selection)
+    if mode == "add" then
+      result:add(new_sel)
+    elseif mode == "subtract" then
+      result:subtract(new_sel)
+    else
+      result:intersect(new_sel)
+    end
+    sprite.selection = result
+  else
+    sprite.selection = new_sel
+  end
 end
 
 function selection_cmds.select_rect(params)
@@ -1795,10 +2122,9 @@ function selection_cmds.select_rect(params)
   if e4 then return e4 end
 
   local mode = base.optional_string(params, "mode", "replace")
+  apply_selection(sprite, Selection(Rectangle(x, y, w, h)), mode)
+
   local sel = sprite.selection
-
-  sel:select(Rectangle(x, y, w, h))
-
   return base.success({
     bounds = { x = sel.bounds.x, y = sel.bounds.y,
                width = sel.bounds.width, height = sel.bounds.height },
@@ -1818,10 +2144,28 @@ function selection_cmds.select_ellipse(params)
   local h, e4 = base.require_number(params, "height")
   if e4 then return e4 end
 
-  app.command.SelectEllipse {
-    ui = false,
-    bounds = Rectangle(x, y, w, h),
-  }
+  local mode = base.optional_string(params, "mode", "replace")
+
+  -- Aseprite has no `SelectEllipse` command; build the selection from per-row
+  -- spans of the ellipse inscribed in the given bounds.
+  local ell = Selection()
+  local rx, ry = w / 2.0, h / 2.0
+  local cx, cy = x + rx, y + ry
+  if rx > 0 and ry > 0 then
+    for row = 0, h - 1 do
+      local py = (y + row + 0.5) - cy
+      local t = 1.0 - (py * py) / (ry * ry)
+      if t > 0 then
+        local dx = rx * math.sqrt(t)
+        local x0 = math.ceil(cx - dx - 0.5)
+        local x1 = math.floor(cx + dx - 0.5)
+        if x1 >= x0 then
+          ell:add(Selection(Rectangle(x0, y + row, x1 - x0 + 1, 1)))
+        end
+      end
+    end
+  end
+  apply_selection(sprite, ell, mode)
 
   local sel = sprite.selection
   return base.success({
@@ -1858,13 +2202,34 @@ function selection_cmds.select_by_color(params)
   if e1 then return e1 end
 
   local tolerance = base.optional_number(params, "tolerance", 0)
+  local mode = base.optional_string(params, "mode", "replace")
   local color = color_util.from_hex(color_hex)
+
+  -- MaskByColor replaces the selection; capture the prior one so we can honour
+  -- add/subtract/intersect modes.
+  local prior = Selection()
+  prior:add(sprite.selection)
 
   app.fgColor = color
   app.command.MaskByColor {
     ui = false,
     tolerance = tolerance,
   }
+
+  if mode == "add" or mode == "subtract" or mode == "intersect" then
+    local produced = Selection()
+    produced:add(sprite.selection)
+    local result = Selection()
+    result:add(prior)
+    if mode == "add" then
+      result:add(produced)
+    elseif mode == "subtract" then
+      result:subtract(produced)
+    else
+      result:intersect(produced)
+    end
+    sprite.selection = result
+  end
 
   local sel = sprite.selection
   return base.success({
@@ -1961,7 +2326,7 @@ function palette_cmds.set_palette(params)
   if err then return err end
 
   local colors = params.colors
-  if not colors or type(colors) ~= "table" then
+  if not base.is_array(colors) or #colors < 1 then
     return base.error_invalid_params("Missing required parameter: colors (array of hex strings)")
   end
 
@@ -2227,7 +2592,7 @@ function tag_cmds.get_tags(params)
       from_frame = tag.fromFrame.frameNumber,
       to_frame = tag.toFrame.frameNumber,
       frame_count = tag.frames,
-      ani_dir = tostring(tag.aniDir),
+      ani_dir = enum_util.ani_dir_name(tag.aniDir),
       repeat_count = tag.repeats,
       color = color_util.to_hex(tag.color),
     }
@@ -2540,8 +2905,8 @@ function tilemap_cmds.create_tilemap_layer(params)
 
   local layer
   app.transaction("Create Tilemap Layer", function()
-    layer = sprite:newLayer()
-    app.layer = layer
+    -- NewLayer{tilemap=true} creates the tilemap layer directly. The previous
+    -- sprite:newLayer() call left an orphan empty layer behind on every call.
     app.command.NewLayer { tilemap = true }
     layer = app.layer
     if name and layer then
@@ -2605,14 +2970,48 @@ function tilemap_cmds.set_tile(params)
   local frame_num = base.optional_number(params, "frame", nil)
   local frame = frame_num and sprite.frames[frame_num] or app.frame
 
-  local cel = layer:cel(frame.frameNumber)
-  if not cel then
-    return base.error(-32001, "No cel at frame " .. frame.frameNumber)
-  end
+  col = base.to_int(col)
+  row = base.to_int(row)
+  tile_index = base.to_int(tile_index)
 
+  local err_out = nil
   app.transaction("Set Tile", function()
+    -- Create the tilemap cel on demand (mirrors get_target_image for regular
+    -- layers); a fresh tilemap layer has no cel, which made set_tile unusable.
+    local cel = layer:cel(frame.frameNumber)
+    if not cel then
+      local gw = sprite.gridBounds.width
+      local gh = sprite.gridBounds.height
+      if gw < 1 then gw = 16 end
+      if gh < 1 then gh = 16 end
+      local cols = math.max(col + 1, math.ceil(sprite.width / gw))
+      local rows = math.max(row + 1, math.ceil(sprite.height / gh))
+      local img = Image(ImageSpec { width = cols, height = rows, colorMode = ColorMode.TILEMAP })
+      img:clear(0)
+      cel = sprite:newCel(layer, frame, img, Point(0, 0))
+    end
+
+    -- Grow the tilemap image if the target cell is outside it.
+    if col >= cel.image.width or row >= cel.image.height then
+      local nw = math.max(col + 1, cel.image.width)
+      local nh = math.max(row + 1, cel.image.height)
+      local ni = Image(ImageSpec { width = nw, height = nh, colorMode = ColorMode.TILEMAP })
+      ni:clear(0)
+      ni:drawImage(cel.image, Point(0, 0))
+      cel.image = ni
+    end
+
+    -- The tileset must already hold tile_index+1 tiles; add empty tiles as needed.
+    local tileset = layer.tileset
+    if tileset then
+      while #tileset <= tile_index do
+        sprite:newTile(tileset)
+      end
+    end
+
     cel.image:putPixel(col, row, tile_index)
   end)
+  if err_out then return err_out end
 
   return base.success({ col = col, row = row, tile_index = tile_index })
 end
@@ -2706,6 +3105,10 @@ function export_cmds.export_png(params)
 
   local frame_num = base.optional_number(params, "frame", nil)
 
+  if app.fs.filePath(path) ~= "" and not app.fs.isDirectory(app.fs.filePath(path)) then
+    app.fs.makeAllDirectories(app.fs.filePath(path))
+  end
+
   if frame_num then
     if frame_num < 1 or frame_num > #sprite.frames then
       return base.error_invalid_params("Frame out of range")
@@ -2728,7 +3131,13 @@ function export_cmds.export_png(params)
     end
   end
 
-  return base.success({ path = path, frames_exported = frame_num and 1 or #sprite.frames })
+  local resolved, exists = base.resolve_saved_path(path)
+  return base.success({
+    path = resolved,
+    requested_path = path,
+    exists = exists,
+    frames_exported = frame_num and 1 or #sprite.frames,
+  })
 end
 
 function export_cmds.export_sprite_sheet(params)
@@ -2810,18 +3219,29 @@ function export_cmds.export_gif(params)
 
   local scale = base.optional_number(params, "scale", 1)
 
+  if app.fs.filePath(path) ~= "" and not app.fs.isDirectory(app.fs.filePath(path)) then
+    app.fs.makeAllDirectories(app.fs.filePath(path))
+  end
+
+  -- saveCopyAs() is UI-driven when a GUI is available, so GIF export pops modal
+  -- "format doesn't support Layers/Tags" + "GIF Options" dialogs and the
+  -- headless MCP call hangs until timeout. The command form with ui=false is
+  -- non-interactive.
   if scale ~= 1 then
     local copy = Sprite(sprite)
+    app.sprite = copy
     app.command.SpriteSize {
       ui = false,
       width = copy.width * scale,
       height = copy.height * scale,
       method = "nearest",
     }
-    copy:saveCopyAs(path)
+    app.command.SaveFileCopyAs { ui = false, filename = path }
     copy:close()
+    app.sprite = sprite
   else
-    sprite:saveCopyAs(path)
+    app.sprite = sprite
+    app.command.SaveFileCopyAs { ui = false, filename = path }
   end
 
   return base.success({ path = path, frames = #sprite.frames })
@@ -2887,9 +3307,19 @@ function export_cmds.export_layers(params)
   local format = base.optional_string(params, "format", "png")
   local visible_only = base.optional_bool(params, "visible_only", false)
 
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
+
+  local ext = format == "aseprite" and ".aseprite" or ("." .. format)
+  local multi_frame = #sprite.frames > 1
+
+  local function sanitize(n)
+    return (n:gsub('[\\/:%*%?"<>|%s]', "_"))
+  end
+
   local exported = {}
   local original_visibility = {}
-
   for _, layer in ipairs(sprite.layers) do
     original_visibility[layer.name] = layer.isVisible
   end
@@ -2902,10 +3332,24 @@ function export_cmds.export_layers(params)
       l.isVisible = (l == layer)
     end
 
-    local ext = format == "aseprite" and ".aseprite" or ("." .. format)
-    local file_path = output_dir .. "/" .. layer.name .. ext
-    sprite:saveCopyAs(file_path)
-    exported[#exported + 1] = { layer = layer.name, path = file_path }
+    local safe_name = sanitize(layer.name)
+    if multi_frame then
+      -- Aseprite appends the frame index on a multi-frame saveCopyAs, so the
+      -- reported single path never matched the files. Render each frame
+      -- explicitly with a deterministic name and report the real list.
+      for fi = 1, #sprite.frames do
+        local img = Image(sprite.spec)
+        img:clear()
+        img:drawSprite(sprite, fi)
+        local file_path = app.fs.joinPath(output_dir, string.format("%s_%d%s", safe_name, fi, ext))
+        img:saveAs(file_path)
+        exported[#exported + 1] = { layer = layer.name, frame = fi, path = file_path }
+      end
+    else
+      local file_path = app.fs.joinPath(output_dir, safe_name .. ext)
+      sprite:saveCopyAs(file_path)
+      exported[#exported + 1] = { layer = layer.name, path = file_path }
+    end
 
     ::continue::
   end
@@ -3016,7 +3460,7 @@ local function build_animation_data(sprite, sheet_type, columns)
         name = tag.name,
         frames = frames,
         loop = tag.repeats == 0,
-        direction = tostring(tag.aniDir),
+        direction = enum_util.ani_dir_name(tag.aniDir),
       }
     end
   else
@@ -3046,40 +3490,73 @@ local function build_animation_data(sprite, sheet_type, columns)
   }
 end
 
--- Helper: generate SpriteFrames .tres content
+-- Helper: generate SpriteFrames .tres content.
+-- Godot 4's SpriteFrames reads only "texture" and "duration" per frame — it has
+-- NO "region" key. Regions must come from AtlasTexture sub-resources (one per
+-- frame). Animation names are StringNames (&"name") and per-frame "duration" is
+-- a multiplier of the animation's "speed" (FPS), not a value in seconds.
 local function generate_tres(texture_res_path, anim_data)
-  local lines = {}
-  lines[#lines + 1] = '[gd_resource type="SpriteFrames" load_steps=2 format=3]'
-  lines[#lines + 1] = ''
-  lines[#lines + 1] = string.format('[ext_resource type="Texture2D" path="%s" id="1"]', texture_res_path)
-  lines[#lines + 1] = ''
+  local tex_id = "1_tex"
+
+  -- Emit one AtlasTexture sub-resource per frame, deduplicating identical
+  -- regions so repeated frames share a sub-resource.
+  local sub_lines = {}
+  local region_to_id = {}
+  local sub_count = 0
+  local function atlas_id_for(r)
+    local key = string.format("%d_%d_%d_%d", r.x, r.y, r.w, r.h)
+    if region_to_id[key] then return region_to_id[key] end
+    local id = "AtlasTexture_" .. sub_count
+    region_to_id[key] = id
+    sub_count = sub_count + 1
+    sub_lines[#sub_lines + 1] = string.format(
+      '[sub_resource type="AtlasTexture" id="%s"]\natlas = ExtResource("%s")\nregion = Rect2(%d, %d, %d, %d)\n',
+      id, tex_id, r.x, r.y, r.w, r.h)
+    return id
+  end
 
   local anim_entries = {}
   for _, anim in ipairs(anim_data.animations) do
+    -- Derive FPS (speed) from the animation's frame durations; use the first
+    -- frame's duration as the base so its multiplier is 1.0 (matches Aseprite).
+    local base_ms = nil
+    for _, f in ipairs(anim.frames) do
+      if f.duration_ms and f.duration_ms > 0 then base_ms = f.duration_ms; break end
+    end
+    if not base_ms or base_ms <= 0 then base_ms = 100 end
+    local speed = 1000.0 / base_ms
+
     local frames_arr = {}
     for _, f in ipairs(anim.frames) do
-      local r = f.region
-      local atlas = string.format(
-        '{"texture": ExtResource("1"), "region": Rect2(%d, %d, %d, %d), "duration": %.3f}',
-        r.x, r.y, r.w, r.h,
-        f.duration_ms / 1000.0
-      )
-      frames_arr[#frames_arr + 1] = atlas
+      local id = atlas_id_for(f.region)
+      local dur_mult = (f.duration_ms and f.duration_ms > 0) and (f.duration_ms / base_ms) or 1.0
+      frames_arr[#frames_arr + 1] = string.format(
+        '{"duration": %.3f, "texture": SubResource("%s")}', dur_mult, id)
     end
 
-    local entry = string.format(
-      '{"name": "%s", "speed": 1.0, "loop": %s, "frames": [%s]}',
-      anim.name,
+    anim_entries[#anim_entries + 1] = string.format(
+      '{\n"frames": [%s],\n"loop": %s,\n"name": &"%s",\n"speed": %.3f\n}',
+      table.concat(frames_arr, ", "),
       anim.loop and "true" or "false",
-      table.concat(frames_arr, ", ")
-    )
-    anim_entries[#anim_entries + 1] = entry
+      anim.name,
+      speed)
   end
 
+  -- load_steps = 1 ext_resource + N sub_resources + 1 (the resource itself)
+  local load_steps = 1 + sub_count + 1
+
+  local lines = {}
+  lines[#lines + 1] = string.format('[gd_resource type="SpriteFrames" load_steps=%d format=3]', load_steps)
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = string.format('[ext_resource type="Texture2D" path="%s" id="%s"]', texture_res_path, tex_id)
+  lines[#lines + 1] = ''
+  for _, sl in ipairs(sub_lines) do
+    lines[#lines + 1] = sl
+  end
   lines[#lines + 1] = '[resource]'
   lines[#lines + 1] = 'animations = [' .. table.concat(anim_entries, ", ") .. ']'
 
-  return table.concat(lines, "\n")
+  return table.concat(lines, "\n") .. "\n"
 end
 
 function godot_cmds.export_for_godot(params)
@@ -3097,16 +3574,15 @@ function godot_cmds.export_for_godot(params)
   local sheet_type_str = base.optional_string(params, "sheet_type", "horizontal")
   local scale = base.optional_number(params, "scale", 1)
   local trim = base.optional_bool(params, "trim", false)
+  -- Explicit res:// texture path wins; otherwise fall back to project root.
+  local texture_res_override = base.optional_string(params, "texture_path", nil)
 
-  local sheet_types = {
-    horizontal = SpriteSheetType.HORIZONTAL,
-    vertical = SpriteSheetType.VERTICAL,
-    rows = SpriteSheetType.ROWS,
-    columns = SpriteSheetType.COLUMNS,
-  }
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
 
-  local png_path = output_dir .. "/" .. name .. ".png"
-  local json_path = output_dir .. "/" .. name .. ".json"
+  local png_path = app.fs.joinPath(output_dir, name .. ".png")
+  local json_path = app.fs.joinPath(output_dir, name .. ".json")
 
   local fw = sprite.width
   local fh = sprite.height
@@ -3144,20 +3620,26 @@ function godot_cmds.export_for_godot(params)
 
   local anim_data = build_animation_data(sprite, sheet_type_str, nil)
 
-  local res_path = "res://" .. name .. ".png"
+  local res_path = texture_res_override or ("res://" .. name .. ".png")
   local tres_content = generate_tres(res_path, anim_data)
-  local tres_path = output_dir .. "/" .. name .. ".tres"
+  local tres_path = app.fs.joinPath(output_dir, name .. ".tres")
 
-  local f = io.open(tres_path, "w")
-  if f then
-    f:write(tres_content)
-    f:close()
+  local ok, werr = base.write_text_file(tres_path, tres_content)
+  if not ok then return werr end
+
+  -- Write the sheet JSON that json_path advertises (was previously never written).
+  local json_written = false
+  local ok_json, encoded = pcall(function() return json.encode(anim_data) end)
+  if ok_json and encoded then
+    local okw = base.write_text_file(json_path, encoded)
+    json_written = okw
   end
 
   return base.success({
     png_path = png_path,
-    json_path = json_path,
+    json_path = json_written and json_path or nil,
     tres_path = tres_path,
+    texture_res_path = res_path,
     animations = #anim_data.animations,
     total_frames = anim_data.frame_count,
   })
@@ -3172,24 +3654,30 @@ function godot_cmds.export_atlas_texture(params)
   local texture_path, e2 = base.require_string(params, "texture_path")
   if e2 then return e2 end
 
+  if #sprite.slices == 0 then
+    return base.error(-32001, "Sprite has no slices to export",
+      { suggestion = "Define slices with create_slice first" })
+  end
+
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
+
   local exported = {}
   for _, slice in ipairs(sprite.slices) do
     local b = slice.bounds
     local content = string.format(
       '[gd_resource type="AtlasTexture" load_steps=2 format=3]\n\n' ..
-      '[ext_resource type="Texture2D" path="%s" id="1"]\n\n' ..
+      '[ext_resource type="Texture2D" path="%s" id="1_tex"]\n\n' ..
       '[resource]\n' ..
-      'atlas = ExtResource("1")\n' ..
+      'atlas = ExtResource("1_tex")\n' ..
       'region = Rect2(%d, %d, %d, %d)\n',
       texture_path, b.x, b.y, b.width, b.height
     )
-    local tres_path = output_dir .. "/" .. slice.name .. ".tres"
-    local f = io.open(tres_path, "w")
-    if f then
-      f:write(content)
-      f:close()
-      exported[#exported + 1] = { name = slice.name, path = tres_path }
-    end
+    local tres_path = app.fs.joinPath(output_dir, slice.name .. ".tres")
+    local ok, werr = base.write_text_file(tres_path, content)
+    if not ok then return werr end
+    exported[#exported + 1] = { name = slice.name, path = tres_path }
   end
 
   return base.success({ exported = exported, count = #exported })
@@ -3226,26 +3714,31 @@ function godot_cmds.export_9patch_for_godot(params)
   local margin_right = b.width - (c.x + c.width)
   local margin_bottom = b.height - (c.y + c.height)
 
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
+
+  -- Emit a real .tscn with a configured NinePatchRect (a NinePatchRect is a
+  -- node, not a resource, so a .tscn is the machine-usable output — the old
+  -- commented-out .txt was not).
   local content = string.format(
-    '# 9-patch data for %s\n' ..
-    '# Use with NinePatchRect node in Godot\n' ..
-    '# texture = "%s"\n' ..
-    '# region = Rect2(%d, %d, %d, %d)\n' ..
-    '# patch_margin_left = %d\n' ..
-    '# patch_margin_top = %d\n' ..
-    '# patch_margin_right = %d\n' ..
-    '# patch_margin_bottom = %d\n',
-    slice_name, texture_path,
+    '[gd_scene load_steps=2 format=3]\n\n' ..
+    '[ext_resource type="Texture2D" path="%s" id="1_tex"]\n\n' ..
+    '[node name="%s" type="NinePatchRect"]\n' ..
+    'texture = ExtResource("1_tex")\n' ..
+    'region_rect = Rect2(%d, %d, %d, %d)\n' ..
+    'patch_margin_left = %d\n' ..
+    'patch_margin_top = %d\n' ..
+    'patch_margin_right = %d\n' ..
+    'patch_margin_bottom = %d\n',
+    texture_path, slice_name,
     b.x, b.y, b.width, b.height,
     margin_left, margin_top, margin_right, margin_bottom
   )
 
-  local info_path = output_dir .. "/" .. slice_name .. "_9patch.txt"
-  local f = io.open(info_path, "w")
-  if f then
-    f:write(content)
-    f:close()
-  end
+  local scene_path = app.fs.joinPath(output_dir, slice_name .. "_9patch.tscn")
+  local ok, werr = base.write_text_file(scene_path, content)
+  if not ok then return werr end
 
   return base.success({
     slice = slice_name,
@@ -3256,7 +3749,7 @@ function godot_cmds.export_9patch_for_godot(params)
       right = margin_right,
       bottom = margin_bottom,
     },
-    info_path = info_path,
+    scene_path = scene_path,
   })
 end
 
@@ -3279,46 +3772,71 @@ function godot_cmds.export_tileset_for_godot(params)
   local tw = base.optional_number(params, "tile_size", tileset.grid.tileSize.width)
   local th = tileset.grid.tileSize.height
   local count = #tileset
+  local name = base.optional_string(params, "name", "tileset")
+  -- Explicit res:// texture path wins; otherwise fall back to project root.
+  local texture_res = base.optional_string(params, "texture_path", "res://" .. name .. ".png")
 
-  local img_path = output_dir .. "/tileset.png"
-  local cols = math.ceil(math.sqrt(count))
-  local rows = math.ceil(count / cols)
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
+
+  local img_path = app.fs.joinPath(output_dir, name .. ".png")
+  local cols = math.max(1, math.ceil(math.sqrt(count)))
+  local rows = math.max(1, math.ceil(count / cols))
   local out_img = Image(tw * cols, th * rows, sprite.colorMode)
   out_img:clear()
 
+  -- Tile 0 in an Aseprite tileset is the empty tile; skip it so the atlas only
+  -- holds real tiles, and record each real tile's atlas coordinate.
+  local tile_coords = {}
+  local placed = 0
   for i = 0, count - 1 do
     local tile = tileset:getTile(i)
     if tile then
-      local col = i % cols
-      local row = math.floor(i / cols)
+      local col = placed % cols
+      local row = math.floor(placed / cols)
       for y = 0, th - 1 do
         for x = 0, tw - 1 do
           out_img:putPixel(col * tw + x, row * th + y, tile:getPixel(x, y))
         end
       end
+      tile_coords[#tile_coords + 1] = { col = col, row = row }
+      placed = placed + 1
     end
   end
   out_img:saveAs(img_path)
 
-  local tres_path = output_dir .. "/tileset.tres"
+  -- A usable Godot 4 TileSet stores its tiles in a TileSetAtlasSource sub-
+  -- resource; a bare tile_size (as emitted before) produces zero usable tiles.
+  local tile_entries = {}
+  for _, tc in ipairs(tile_coords) do
+    tile_entries[#tile_entries + 1] = string.format('%d:%d/0 = 0', tc.col, tc.row)
+  end
+
   local tres_content = string.format(
-    '[gd_resource type="TileSet" load_steps=2 format=3]\n\n' ..
-    '[ext_resource type="Texture2D" path="res://tileset.png" id="1"]\n\n' ..
+    '[gd_resource type="TileSet" load_steps=3 format=3]\n\n' ..
+    '[ext_resource type="Texture2D" path="%s" id="1_tex"]\n\n' ..
+    '[sub_resource type="TileSetAtlasSource" id="TileSetAtlasSource_0"]\n' ..
+    'texture = ExtResource("1_tex")\n' ..
+    'texture_region_size = Vector2i(%d, %d)\n' ..
+    '%s\n\n' ..
     '[resource]\n' ..
-    'tile_size = Vector2i(%d, %d)\n',
+    'tile_size = Vector2i(%d, %d)\n' ..
+    'sources/0 = SubResource("TileSetAtlasSource_0")\n',
+    texture_res, tw, th,
+    table.concat(tile_entries, "\n"),
     tw, th
   )
 
-  local f = io.open(tres_path, "w")
-  if f then
-    f:write(tres_content)
-    f:close()
-  end
+  local tres_path = app.fs.joinPath(output_dir, name .. ".tres")
+  local ok, werr = base.write_text_file(tres_path, tres_content)
+  if not ok then return werr end
 
   return base.success({
     image_path = img_path,
     tres_path = tres_path,
-    tile_count = count,
+    texture_res_path = texture_res,
+    tile_count = placed,
     tile_width = tw,
     tile_height = th,
   })
@@ -3350,12 +3868,8 @@ function godot_cmds.generate_spriteframes_tres(params)
   local anim_data = build_animation_data(sprite, sheet_type, columns)
   local tres_content = generate_tres(texture_path, anim_data)
 
-  local f = io.open(output_path, "w")
-  if not f then
-    return base.error(-32603, "Failed to write .tres file: " .. output_path)
-  end
-  f:write(tres_content)
-  f:close()
+  local ok, werr = base.write_text_file(output_path, tres_content)
+  if not ok then return werr end
 
   return base.success({
     output_path = output_path,
@@ -3377,26 +3891,22 @@ function godot_cmds.sync_to_godot_project(params)
   end
   local scale = base.optional_number(params, "scale", 1)
 
-  local full_dir = godot_path .. "/" .. target_dir
+  local full_dir = app.fs.joinPath(godot_path, target_dir)
+  if not app.fs.isDirectory(full_dir) then
+    app.fs.makeAllDirectories(full_dir)
+  end
 
-  os.execute('mkdir "' .. full_dir .. '" 2>nul')
-
+  -- Pass the correct res:// texture path so export_for_godot writes the .tres
+  -- with the right reference directly (no second overwrite needed).
+  local res_texture = "res://" .. target_dir .. "/" .. name .. ".png"
   local result = godot_cmds.export_for_godot({
     output_dir = full_dir,
     name = name,
     scale = scale,
+    texture_path = res_texture,
   })
 
   if result.result then
-    local res_texture = "res://" .. target_dir .. "/" .. name .. ".png"
-    local anim_data = build_animation_data(sprite, "horizontal", nil)
-    local tres_content = generate_tres(res_texture, anim_data)
-    local tres_path = full_dir .. "/" .. name .. ".tres"
-    local f = io.open(tres_path, "w")
-    if f then
-      f:write(tres_content)
-      f:close()
-    end
     result.result.tres_texture_path = res_texture
   end
 
@@ -3409,14 +3919,29 @@ function godot_cmds.batch_export_for_godot(params)
 
   local target_dir = base.optional_string(params, "target_dir", "assets/sprites")
   local scale = base.optional_number(params, "scale", 1)
-  local full_dir = godot_path .. "/" .. target_dir
+  local full_dir = app.fs.joinPath(godot_path, target_dir)
+  if not app.fs.isDirectory(full_dir) then
+    app.fs.makeAllDirectories(full_dir)
+  end
 
-  os.execute('mkdir "' .. full_dir .. '" 2>nul')
-
+  -- De-duplicate output names: unsaved sprites all report filename "Sprite", so
+  -- without this every unnamed sprite overwrites the same files.
+  local used_names = {}
   local exported = {}
-  for _, sprite in ipairs(app.sprites) do
+  for si, sprite in ipairs(app.sprites) do
     app.sprite = sprite
-    local name = sprite.filename:match("([^/\\]+)%.%w+$") or "sprite"
+    local base_name = sprite.filename:match("([^/\\]+)%.%w+$")
+    if not base_name or base_name == "" then
+      base_name = "sprite" .. si
+    end
+    local name = base_name
+    local suffix = 2
+    while used_names[name] do
+      name = base_name .. "_" .. suffix
+      suffix = suffix + 1
+    end
+    used_names[name] = true
+
     local result = godot_cmds.export_for_godot({
       output_dir = full_dir,
       name = name,
@@ -3608,8 +4133,15 @@ function analysis_cmds.find_unused_colors(params)
   if err then return err end
 
   if sprite.colorMode ~= ColorMode.INDEXED then
-    return base.error(-32001, "find_unused_colors only works with indexed color mode sprites")
+    return base.error(-32001,
+      "find_unused_colors only works with indexed color mode sprites (this sprite is " ..
+      enum_util.color_mode_name(sprite.colorMode) .. ")")
   end
+
+  -- max_colors caps the number of unused entries returned. A default 256-colour
+  -- palette on a tiny sprite otherwise returns ~255 identical entries.
+  local max_colors = base.to_int(base.optional_number(params, "max_colors", 64))
+  if max_colors < 1 then max_colors = 1 end
 
   local palette = sprite.palettes[1]
   local used = {}
@@ -3629,19 +4161,29 @@ function analysis_cmds.find_unused_colors(params)
     end
   end
 
+  -- Collapse duplicate palette entries by hex so a padded palette full of the
+  -- same colour does not produce a wall of identical rows.
   local unused = {}
+  local total_unused = 0
+  local seen_hex = {}
   for i = 0, #palette - 1 do
     if not used[i] then
-      unused[#unused + 1] = {
-        index = i,
-        color = color_util.to_hex(palette:getColor(i)),
-      }
+      total_unused = total_unused + 1
+      local hex = color_util.to_hex(palette:getColor(i))
+      if not seen_hex[hex] then
+        seen_hex[hex] = true
+        if #unused < max_colors then
+          unused[#unused + 1] = { index = i, color = hex }
+        end
+      end
     end
   end
 
   return base.success({
     unused_colors = unused,
     unused_count = #unused,
+    total_unused = total_unused,
+    truncated = total_unused > #unused,
     palette_size = #palette,
   })
 end
@@ -4159,41 +4701,50 @@ function advanced_cmds.draw_symmetry(params)
 
   local cm = sprite.colorMode
   local palette = sprite.palettes[1]
-  local img = cel.image
-  local ox, oy = cel.position.x, cel.position.y
   local pixels_drawn = 0
 
-  local function put(x, y, pv)
-    local lx = x - ox
-    local ly = y - oy
-    if lx >= 0 and ly >= 0 and lx < img.width and ly < img.height then
-      img:putPixel(lx, ly, pv)
-      pixels_drawn = pixels_drawn + 1
+  -- Collect every target point (source + mirrors) so the cel can be grown once
+  -- to cover them all; otherwise mirrored writes outside the cel are dropped.
+  local writes = {}
+  local function add_write(x, y, pv)
+    writes[#writes + 1] = { x = base.to_int(x), y = base.to_int(y), pv = pv }
+  end
+  for i = 1, #pixels do
+    local p = pixels[i]
+    if p and p.x and p.y and p.color then
+      local color = color_util.from_hex(p.color)
+      local pv = color_util.color_to_pixel(color, cm, palette)
+      local x, y = base.to_int(p.x), base.to_int(p.y)
+      add_write(x, y, pv)
+      if mode == "horizontal" or mode == "both" then
+        add_write(2 * axis_x - x - 1, y, pv)
+      end
+      if mode == "vertical" or mode == "both" then
+        add_write(x, 2 * axis_y - y - 1, pv)
+      end
+      if mode == "both" then
+        add_write(2 * axis_x - x - 1, 2 * axis_y - y - 1, pv)
+      end
     end
   end
 
   app.transaction("Draw Symmetry", function()
-    for i = 1, #pixels do
-      local p = pixels[i]
-      if p and p.x and p.y and p.color then
-        local color = color_util.from_hex(p.color)
-        local pv = color_util.color_to_pixel(color, cm, palette)
-        local x, y = p.x, p.y
-
-        put(x, y, pv)
-
-        if mode == "horizontal" or mode == "both" then
-          local mx = 2 * axis_x - x - 1
-          put(mx, y, pv)
-        end
-        if mode == "vertical" or mode == "both" then
-          local my = 2 * axis_y - y - 1
-          put(x, my, pv)
-        end
-        if mode == "both" then
-          local mx = 2 * axis_x - x - 1
-          local my = 2 * axis_y - y - 1
-          put(mx, my, pv)
+    if #writes > 0 then
+      local minx, miny, maxx, maxy = writes[1].x, writes[1].y, writes[1].x, writes[1].y
+      for _, wpt in ipairs(writes) do
+        if wpt.x < minx then minx = wpt.x end
+        if wpt.y < miny then miny = wpt.y end
+        if wpt.x > maxx then maxx = wpt.x end
+        if wpt.y > maxy then maxy = wpt.y end
+      end
+      grow_cel_to_include(sprite, cel, minx, miny, maxx - minx + 1, maxy - miny + 1)
+      local img = cel.image
+      local ox, oy = cel.position.x, cel.position.y
+      for _, wpt in ipairs(writes) do
+        local lx, ly = wpt.x - ox, wpt.y - oy
+        if lx >= 0 and ly >= 0 and lx < img.width and ly < img.height then
+          img:putPixel(lx, ly, wpt.pv)
+          pixels_drawn = pixels_drawn + 1
         end
       end
     end
@@ -4207,7 +4758,7 @@ function advanced_cmds.generate_color_ramp(params)
   local base_hex, e1 = base.require_string(params, "base_color")
   if e1 then return e1 end
 
-  local steps = base.optional_number(params, "steps", 5)
+  local steps = base.to_int(base.optional_number(params, "steps", 5))
   local hue_shift = base.optional_number(params, "hue_shift", 0)
   local set_pal = base.optional_bool(params, "set_palette", false)
 
@@ -4215,7 +4766,9 @@ function advanced_cmds.generate_color_ramp(params)
   local bh, bs_val, bl = rgb_to_hsl(bc.red, bc.green, bc.blue)
 
   local colors = {}
-  local total = steps * 2 + 1
+  -- `steps` is the total number of colours returned (shadow side + base +
+  -- highlight side), so the count matches the requested value.
+  local total = math.max(2, steps)
 
   for i = 0, total - 1 do
     local frac = i / (total - 1)
@@ -4644,12 +5197,13 @@ function advanced_cmds.generate_animation_player_tres(params)
     }
   end
 
-  -- Build .tres content
+  -- Build .tres content. The tracks animate ".:frame", so the Texture2D is
+  -- never referenced — the ext_resource is dropped (texture_path is accepted
+  -- for backward compatibility but intentionally unused).
   local lines = {}
   local anim_count = #animations
-  lines[#lines + 1] = string.format('[gd_resource type="AnimationLibrary" load_steps=%d format=3]', anim_count + 2)
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = string.format('[ext_resource type="Texture2D" path="%s" id="1"]', texture_path)
+  -- load_steps = N sub_resources + 1 (the resource itself)
+  lines[#lines + 1] = string.format('[gd_resource type="AnimationLibrary" load_steps=%d format=3]', anim_count + 1)
   lines[#lines + 1] = ""
 
   local anim_names = {}
@@ -4692,20 +5246,21 @@ function advanced_cmds.generate_animation_player_tres(params)
     anim_names[#anim_names + 1] = anim.name
   end
 
-  lines[#lines + 1] = '[resource]'
+  -- Emit a SINGLE merged _data dictionary. The previous code wrote one
+  -- `_data = {...}` line per animation; the parser applies them in order, so
+  -- only the last animation survived.
+  local data_entries = {}
   for ai, anim in ipairs(animations) do
     local res_id = tostring(ai + 1)
-    lines[#lines + 1] = string.format('_data = {"%s": SubResource("%s")}', anim.name, res_id)
+    data_entries[#data_entries + 1] = string.format('&"%s": SubResource("%s")', anim.name, res_id)
   end
+  lines[#lines + 1] = '[resource]'
+  lines[#lines + 1] = '_data = {' .. table.concat(data_entries, ", ") .. '}'
 
-  local content = table.concat(lines, "\n")
+  local content = table.concat(lines, "\n") .. "\n"
 
-  local f = io.open(output_path, "w")
-  if not f then
-    return base.error(-32603, "Failed to write file: " .. output_path)
-  end
-  f:write(content)
-  f:close()
+  local ok, werr = base.write_text_file(output_path, content)
+  if not ok then return werr end
 
   return base.success({
     output_path = output_path,
@@ -5157,8 +5712,16 @@ local function dispatch(method, params)
     return { method = "pong" }
   end
 
-  if method == "get_version" then
-    return { result = { version = VERSION, tool_count = count_keys(handlers) } }
+  if method == "get_version" or method == "get_server_info" then
+    return { result = {
+      extension_version = VERSION,
+      version = VERSION,
+      tool_count = count_keys(handlers),
+      aseprite_version = tostring(app.version),
+      api_version = app.apiVersion,
+      ui_available = app.isUIAvailable,
+      port = port,
+    } }
   end
 
   local handler = handlers[method]
@@ -5221,6 +5784,16 @@ end
 ----------------------------------------------------------------------
 -- WebSocket connection
 ----------------------------------------------------------------------
+-- Advance to the next port in the scan range. Multiple MCP servers bind
+-- 6515..6519; a single hard-coded port can never reach a server that landed on
+-- a fallback port, so failed reconnects rotate through the range.
+local function advance_port()
+  port = port + 1
+  if port > PORT_MAX or port < PORT_MIN then
+    port = PORT_MIN
+  end
+end
+
 local function connect()
   -- Destroy old connection completely
   if ws then
@@ -5228,6 +5801,7 @@ local function connect()
     ws = nil
   end
   connected = false
+  last_activity = os.time()
 
   local url = "ws://127.0.0.1:" .. port
   print("[MCP] Connecting to " .. url .. "...")
@@ -5236,6 +5810,7 @@ local function connect()
     url = url,
     deflate = false,
     onreceive = function(mt, data, err)
+      last_activity = os.time()
       if mt == WebSocketMessageType.OPEN then
         connected = true
         print("[MCP] Connected to MCP server")
@@ -5270,7 +5845,28 @@ local function start_health_check()
   health_timer = Timer {
     interval = RECONNECT_INTERVAL_MS / 1000.0,
     ontick = function()
-      if not connected and not ws then
+      local now = os.time()
+      local stale = (now - last_activity) > STALE_SECONDS
+      if connected then
+        -- Server pings keep last_activity fresh; if it goes stale the peer
+        -- vanished without a CLOSE/ERROR event — force a reconnect.
+        if stale then
+          print("[MCP] Connection stale, forcing reconnect")
+          if ws then pcall(function() ws:close() end) end
+          ws = nil
+          connected = false
+          advance_port()
+          connect()
+        end
+      elseif not ws then
+        connect()
+      elseif stale then
+        -- Stuck mid-connect (no OPEN and no CLOSE/ERROR): drop it and try the
+        -- next port in the range.
+        print("[MCP] Connect attempt stalled, trying next port")
+        pcall(function() ws:close() end)
+        ws = nil
+        advance_port()
         connect()
       end
     end
@@ -5317,6 +5913,7 @@ function init(plugin)
           "Status: " .. status,
           "Port: " .. port,
           "Commands: " .. count_keys(handlers),
+          "Aseprite: " .. tostring(app.version) .. " (API " .. tostring(app.apiVersion) .. ")",
         },
       }
     end,

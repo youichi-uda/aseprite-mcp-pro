@@ -2,7 +2,7 @@
   "name": "aseprite-mcp-pro",
   "displayName": "Aseprite MCP Pro",
   "description": "MCP bridge for AI-powered pixel art editing in Aseprite",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "aseprite-mcp-pro",
   "publisher": "aseprite-mcp-pro",
   "license": "MIT",
