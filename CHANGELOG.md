@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.2.2 (2026-07-21)
+
+Self-review pass over v1.2.1, plus a retry of the one deferred item — which turned out to already work.
+
+### Selection clipping: fully covered after all
+- **`draw_rect` / `draw_ellipse` / `flood_fill` / `draw_line` / `draw_brush_stroke` natively honor the active selection** — Aseprite's `app.useTool` pipeline clips to the mask (verified in-engine with per-pixel checks: inside painted, outside preserved; flood fill seeded outside a selection does not leak in, and vice versa). The v1.2.1 changelog wrongly stated these "still draw unclipped"; that was a mis-diagnosis caused by Aseprite trimming the cel to the drawn region and out-of-bounds reads returning garbage during testing. Combined with v1.2.1's `replace_color` / `clear_image` support, the whole drawing group now respects the selection.
+
+### Fixed
+- **`get_autotile_rules` returned `rules: null`**: the decoded rules (Aseprite JSON userdata) were embedded directly in the response, and re-encoding nested userdata silently yields null. Rules are rebuilt as plain tables (`index`, `col`, `row`, `bitmask`/`edge_mask`).
+- **Port hunting never actually rotated on normal networking**: a dead port fails instantly with ECONNREFUSED, and the reconnect loop retried the same port forever (the rotation only fired via the 20 s stale timer, i.e. effectively only under WSL mirrored networking). Failed connects now rotate to the next port until the first session is established; after that, the port that carried the session is preferred across a few failures before rotating (and the scan cycles back to it), preserving v1.2.1's anti-drift behaviour.
+
 ## v1.2.1 (2026-07-21)
 
 Follow-up to the v1.2.0 audit: the reporter re-tested all 121 tools against v1.2.0 and flagged a small set of remaining issues. Thanks again.

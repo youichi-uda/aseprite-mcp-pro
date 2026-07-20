@@ -53,7 +53,7 @@ local RECONNECT_INTERVAL_MS = 3000
 -- If no message (incl. server pings) arrives within this window, treat the
 -- connection as dead and force a reconnect even if no CLOSE/ERROR event fired.
 local STALE_SECONDS = 20
-local VERSION = "1.2.1"
+local VERSION = "1.2.2"
 
 -- State
 local ws = nil
@@ -5453,14 +5453,31 @@ function advanced_cmds.get_autotile_rules(params)
   if not ok_dec or decoded == nil or decoded.autotile_type == nil then
     return base.success({ defined = false })
   end
+
+  -- Rebuild rules as plain Lua tables: json.decode returns userdata, and
+  -- re-encoding nested userdata in the response silently yields null.
+  local rules = {}
+  if base.is_array(decoded.rules) then
+    for i = 1, #decoded.rules do
+      local r = decoded.rules[i]
+      rules[#rules + 1] = {
+        index = base.to_int(r.index),
+        col = base.to_int(r.col),
+        row = base.to_int(r.row),
+        bitmask = r.bitmask ~= nil and base.to_int(r.bitmask) or nil,
+        edge_mask = r.edge_mask ~= nil and base.to_int(r.edge_mask) or nil,
+      }
+    end
+  end
+
   return base.success({
     defined = true,
     autotile_type = decoded.autotile_type,
-    tile_size = decoded.tile_size,
-    columns = decoded.columns,
-    rows = decoded.rows,
-    tile_count = decoded.tile_count,
-    rules = decoded.rules,
+    tile_size = base.to_int(decoded.tile_size),
+    columns = base.to_int(decoded.columns),
+    rows = base.to_int(decoded.rows),
+    tile_count = base.to_int(decoded.tile_count),
+    rules = rules,
   })
 end
 
@@ -5934,6 +5951,14 @@ end
 -- close themselves, never the shared `ws`.
 local generation = 0
 local stale_retries = 0
+-- Port-hunting state: while we have never connected, every failed attempt
+-- rotates to the next port (a dead port errors instantly on normal networking,
+-- so waiting for the stale timer would never hunt). Once a port has carried a
+-- session, stick to it across a few failures before rotating — the established
+-- server almost always still owns it.
+local sticky_port = nil
+local sticky_fails = 0
+local connect_failed = false
 
 local function connect()
   -- Destroy old connection completely
@@ -5945,6 +5970,7 @@ local function connect()
   last_activity = os.time()
   generation = generation + 1
   local my_gen = generation
+  local opened = false
 
   local url = "ws://127.0.0.1:" .. port
   print("[MCP] Connecting to " .. url .. "...")
@@ -5963,7 +5989,10 @@ local function connect()
       last_activity = os.time()
       if mt == WebSocketMessageType.OPEN then
         connected = true
+        opened = true
         stale_retries = 0
+        sticky_port = port
+        sticky_fails = 0
         print("[MCP] Connected to MCP server")
       elseif mt == WebSocketMessageType.TEXT then
         on_message(data)
@@ -5974,6 +6003,11 @@ local function connect()
         if ws == sock then ws = nil end
       elseif mt == WebSocketMessageType.ERROR then
         connected = false
+        if not opened then
+          -- Connect attempt failed (e.g. ECONNREFUSED): let the health check
+          -- decide whether to rotate to the next port.
+          connect_failed = true
+        end
         print("[MCP] WebSocket error: " .. tostring(err))
         pcall(function() sock:close() end)
         if ws == sock then ws = nil end
@@ -6021,14 +6055,39 @@ local function start_health_check()
           connect()
         end
       elseif not ws then
+        if connect_failed then
+          connect_failed = false
+          if sticky_port == nil or port ~= sticky_port then
+            -- Never had a session (or already off the known-good port): hunt.
+            advance_port()
+          else
+            -- The port that carried our last session refused us; give it a few
+            -- chances (server may be restarting) before rotating away.
+            sticky_fails = sticky_fails + 1
+            if sticky_fails >= 3 then
+              sticky_fails = 0
+              advance_port()
+            end
+          end
+        end
         connect()
       elseif stale then
-        -- Stuck mid-connect while hunting (no OPEN, no CLOSE/ERROR): rotate to
-        -- find a listening server.
-        print("[MCP] Connect attempt stalled, trying next port")
+        -- Stuck mid-connect (no OPEN, no CLOSE/ERROR — WSL mirrored networking
+        -- hangs instead of erroring). Apply the same stickiness as the error
+        -- path: hunt freely until the first session, then prefer the port that
+        -- last carried one.
+        print("[MCP] Connect attempt stalled")
         pcall(function() ws:close() end)
         ws = nil
-        advance_port()
+        if sticky_port == nil or port ~= sticky_port then
+          advance_port()
+        else
+          sticky_fails = sticky_fails + 1
+          if sticky_fails >= 3 then
+            sticky_fails = 0
+            advance_port()
+          end
+        end
         connect()
       end
     end
