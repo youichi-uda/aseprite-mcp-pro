@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2.1 (2026-07-21)
+
+Follow-up to the v1.2.0 audit: the reporter re-tested all 121 tools against v1.2.0 and flagged a small set of remaining issues. Thanks again.
+
+### Fixed — connection stability
+- **Stale-socket CLOSE tore down the live connection** (the "MCP connection keeps dropping" flap on a single client): each socket is now tagged with a generation number and ignores its own events once superseded, and CLOSE/ERROR close *that* socket rather than the shared handle. This removes the self-sustaining reconnect/close storm.
+- **Port drift under WSL mirrored networking**: once a connection is established the extension stays on that port instead of rotating away when a reconnect is needed (a dead-port connect hangs rather than erroring under WSL mirrored mode, which previously caused it to drift off a live server). It only rotates while still hunting for a listener, or after several consecutive stale cycles. An out-of-range inherited port preference is clamped back into 6515–6519.
+- **Server: `ASEPRITE_MCP_PORT` now pins the port** (binds exactly that port with no scan), so a user can fix the port at both ends — the reliable single-owner setup. Without it, the free-port scan is unchanged. Note: running multiple MCP servers against one Aseprite still needs a single-owner broker in front of one socket; that architectural change is not included.
+
+### Fixed — remaining false success / correctness
+- **`export_tags_as_sheets(json: true)`** now writes a per-tag sheet JSON (frame regions, durations, loop, direction) — the flag was read but never used.
+- **`export_png` / `save_sprite`** now include a `path_rewritten` flag when a POSIX-style absolute path is silently remapped to a Windows drive path, so a client no longer has to diff two fields to notice.
+- **`sync_to_godot_project`** and **`export_tags_as_sheets`** return single-separator filesystem paths (`app.fs.joinPath` / `normalizePath`); the `res://` path keeps forward slashes.
+- **`get_image_data(hex_array)`** now emits 8-digit `#RRGGBBAA` uniformly, so a `get → set` round-trip is byte-identical regardless of opacity.
+
+### Added
+- **Stable sprite id**: `list_open_sprites` returns a per-session `id`, and `set_active_sprite` / `copy_between_sprites` accept it (unambiguous when several unsaved sprites share the name "Sprite"). Filenames still work.
+- **`get_autotile_rules`**: reads back the metadata stored by `define_autotile_rules` (previously write-only).
+- **Selection-aware editing**: `replace_color` and `clear_image` now restrict their effect to the active selection when one exists. (Shape/fill tools — `draw_rect`/`draw_ellipse`/`flood_fill` — still draw unclipped; that remains future work.)
+
 ## v1.2.0 (2026-07-20)
 
 Bug-fix release addressing an external user's full functional audit of all 121 tools (each invoked against a live Aseprite instance and verified by pixel read-back / filesystem inspection). Huge thanks to the reporter. All fixes were re-verified against Aseprite 1.3.x, and the three Godot resource generators were confirmed to load correctly in Godot 4.6.

@@ -53,7 +53,7 @@ local RECONNECT_INTERVAL_MS = 3000
 -- If no message (incl. server pings) arrives within this window, treat the
 -- connection as dead and force a reconnect even if no CLOSE/ERROR event fired.
 local STALE_SECONDS = 20
-local VERSION = "1.2.0"
+local VERSION = "1.2.1"
 
 -- State
 local ws = nil
@@ -105,6 +105,13 @@ function color_util.to_hex(color, include_alpha)
   end
   return string.format("#%02X%02X%02X",
     color.red, color.green, color.blue)
+end
+
+-- Always 8 digits (#RRGGBBAA), so a get_image_data(hex_array) -> set_image_data
+-- round-trip is byte-identical regardless of opacity.
+function color_util.to_hex8(color)
+  return string.format("#%02X%02X%02X%02X",
+    color.red, color.green, color.blue, color.alpha)
 end
 
 function color_util.pixel_to_color(pixel_value, color_mode, palette)
@@ -375,7 +382,15 @@ end
 -- string hides where the file really went.
 function base.resolve_saved_path(path)
   local norm = app.fs.normalizePath(path)
-  return norm, app.fs.isFile(norm)
+  -- Detect a meaning-changing rewrite: on Windows a POSIX-style absolute path
+  -- ("/tmp/x") that is not a UNC path ("//host/share") gets rewritten to a
+  -- drive-relative path — the file lands on C:\, not where the caller meant.
+  local rewritten = false
+  if app.fs.pathSeparator == "\\" then
+    local is_posix_abs = path:sub(1, 1) == "/" and path:sub(1, 2) ~= "//"
+    if is_posix_abs then rewritten = true end
+  end
+  return norm, app.fs.isFile(norm), rewritten
 end
 
 function base.is_array(v)
@@ -483,11 +498,12 @@ function sprite_cmds.save_sprite(params)
     else
       sprite:saveCopyAs(path)
     end
-    local resolved, exists = base.resolve_saved_path(path)
+    local resolved, exists, rewritten = base.resolve_saved_path(path)
     return base.success({
       filename = resolved,
       requested_path = path,
       exists = exists,
+      path_rewritten = rewritten,
       saved_as_copy = not rename,
     })
   elseif sprite.filename and sprite.filename ~= "" and sprite.filename ~= "Sprite" then
@@ -569,6 +585,7 @@ function sprite_cmds.list_open_sprites(params)
   local sprites = {}
   for i, s in ipairs(app.sprites) do
     sprites[i] = {
+      id = s.id,                 -- stable per-session handle (unambiguous)
       filename = s.filename,
       width = s.width,
       height = s.height,
@@ -580,17 +597,33 @@ function sprite_cmds.list_open_sprites(params)
   return base.success({ sprites = sprites, count = #sprites })
 end
 
-function sprite_cmds.set_active_sprite(params)
-  local filename, err = base.require_string(params, "filename")
-  if err then return err end
-
-  for _, s in ipairs(app.sprites) do
-    if s.filename == filename or s.filename:match("[/\\]" .. filename .. "$") then
-      app.sprite = s
-      return base.success({ active = s.filename })
+-- Resolve a sprite by stable `id` (preferred, unambiguous) or `filename`.
+function base.resolve_sprite(params)
+  local id = params.id
+  if id ~= nil then
+    local want = base.to_int(id)
+    for _, s in ipairs(app.sprites) do
+      if s.id == want then return s, nil end
     end
+    return nil, base.error(-32001, "Sprite not found by id: " .. tostring(want))
   end
-  return base.error(-32001, "Sprite not found: " .. filename)
+  local filename = params.filename
+  if filename ~= nil and type(filename) == "string" and filename ~= "" then
+    for _, s in ipairs(app.sprites) do
+      if s.filename == filename or s.filename:match("[/\\]" .. filename .. "$") then
+        return s, nil
+      end
+    end
+    return nil, base.error(-32001, "Sprite not found: " .. filename)
+  end
+  return nil, base.error_invalid_params("Provide a sprite 'id' (from list_open_sprites) or 'filename'")
+end
+
+function sprite_cmds.set_active_sprite(params)
+  local s, err = base.resolve_sprite(params)
+  if err then return err end
+  app.sprite = s
+  return base.success({ active = s.filename, id = s.id })
 end
 
 function sprite_cmds.resize_sprite(params)
@@ -1585,7 +1618,7 @@ function drawing_cmds.get_image_data(params)
       for x = 0, cel.image.width - 1 do
         local pv = cel.image:getPixel(x, y)
         local c = color_util.pixel_to_color(pv, sprite.colorMode, palette)
-        pixels[#pixels + 1] = color_util.to_hex(c, true)
+        pixels[#pixels + 1] = color_util.to_hex8(c)
       end
     end
     return base.success({
@@ -1909,6 +1942,9 @@ function drawing_cmds.clear_image(params)
   local frame, e2 = base.get_target_frame(sprite, params)
   if e2 then return e2 end
 
+  local sel = sprite.selection
+  local use_sel = sel ~= nil and not sel.isEmpty
+
   app.transaction("Clear Image", function()
     local cel = layer:cel(frame.frameNumber)
     if color_hex then
@@ -1924,8 +1960,30 @@ function drawing_cmds.clear_image(params)
         grow_cel_to_include(sprite, cel, 0, 0, sprite.width, sprite.height)
         cel.image:clear(pv)
       end
+      -- If a selection is active, keep only the pixels inside it.
+      if use_sel then
+        local img = cel.image
+        for y = 0, img.height - 1 do
+          for x = 0, img.width - 1 do
+            if not sel:contains(x + cel.position.x, y + cel.position.y) then
+              img:putPixel(x, y, 0)
+            end
+          end
+        end
+      end
     elseif cel then
-      cel.image:clear()
+      if use_sel then
+        local img = cel.image
+        for y = 0, img.height - 1 do
+          for x = 0, img.width - 1 do
+            if sel:contains(x + cel.position.x, y + cel.position.y) then
+              img:putPixel(x, y, 0)
+            end
+          end
+        end
+      else
+        cel.image:clear()
+      end
     end
   end)
 
@@ -1952,25 +2010,30 @@ function drawing_cmds.replace_color(params)
   local to_pv = color_util.color_to_pixel(to_color, cm, palette)
 
   local replaced = 0
+  -- Honour an active selection: only replace pixels inside it.
+  local sel = sprite.selection
+  local use_sel = sel ~= nil and not sel.isEmpty
 
   app.transaction("Replace Color", function()
-    local function replace_in_image(img)
+    local function replace_in_image(img, ox, oy)
       for y = 0, img.height - 1 do
         for x = 0, img.width - 1 do
-          local pv = img:getPixel(x, y)
-          if tolerance == 0 then
-            if pv == from_pv then
-              img:putPixel(x, y, to_pv)
-              replaced = replaced + 1
-            end
-          else
-            local c = color_util.pixel_to_color(pv, cm, palette)
-            local dr = math.abs(c.red - from_color.red)
-            local dg = math.abs(c.green - from_color.green)
-            local db = math.abs(c.blue - from_color.blue)
-            if dr <= tolerance and dg <= tolerance and db <= tolerance then
-              img:putPixel(x, y, to_pv)
-              replaced = replaced + 1
+          if (not use_sel) or sel:contains(x + ox, y + oy) then
+            local pv = img:getPixel(x, y)
+            if tolerance == 0 then
+              if pv == from_pv then
+                img:putPixel(x, y, to_pv)
+                replaced = replaced + 1
+              end
+            else
+              local c = color_util.pixel_to_color(pv, cm, palette)
+              local dr = math.abs(c.red - from_color.red)
+              local dg = math.abs(c.green - from_color.green)
+              local db = math.abs(c.blue - from_color.blue)
+              if dr <= tolerance and dg <= tolerance and db <= tolerance then
+                img:putPixel(x, y, to_pv)
+                replaced = replaced + 1
+              end
             end
           end
         end
@@ -1982,7 +2045,7 @@ function drawing_cmds.replace_color(params)
         if not layer.isGroup then
           for _, frame in ipairs(sprite.frames) do
             local cel = layer:cel(frame.frameNumber)
-            if cel then replace_in_image(cel.image) end
+            if cel then replace_in_image(cel.image, cel.position.x, cel.position.y) end
           end
         end
       end
@@ -1990,11 +2053,11 @@ function drawing_cmds.replace_color(params)
       local layer = app.layer
       for _, frame in ipairs(sprite.frames) do
         local cel = layer:cel(frame.frameNumber)
-        if cel then replace_in_image(cel.image) end
+        if cel then replace_in_image(cel.image, cel.position.x, cel.position.y) end
       end
     else
       local cel = app.cel
-      if cel then replace_in_image(cel.image) end
+      if cel then replace_in_image(cel.image, cel.position.x, cel.position.y) end
     end
   end)
 
@@ -3131,11 +3194,12 @@ function export_cmds.export_png(params)
     end
   end
 
-  local resolved, exists = base.resolve_saved_path(path)
+  local resolved, exists, rewritten = base.resolve_saved_path(path)
   return base.success({
     path = resolved,
     requested_path = path,
     exists = exists,
+    path_rewritten = rewritten,
     frames_exported = frame_num and 1 or #sprite.frames,
   })
 end
@@ -3374,6 +3438,10 @@ function export_cmds.export_tags_as_sheets(params)
   local scale = base.optional_number(params, "scale", 1)
   local export_json = base.optional_bool(params, "json", false)
 
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
+
   local exported = {}
   local fw = sprite.width
   local fh = sprite.height
@@ -3390,6 +3458,7 @@ function export_cmds.export_tags_as_sheets(params)
 
     local sheet = Image(sw, sh, sprite.colorMode)
     sheet:clear()
+    local frames_meta = {}
     for i = 0, fc - 1 do
       local img = Image(sprite.spec)
       img:drawSprite(sprite, from + i)
@@ -3400,15 +3469,43 @@ function export_cmds.export_tags_as_sheets(params)
           sheet:putPixel(dx + x, dy + y, img:getPixel(x, y))
         end
       end
+      frames_meta[#frames_meta + 1] = {
+        index = i,
+        region = { x = dx, y = dy, w = fw, h = fh },
+        duration_ms = math.floor(sprite.frames[from + i].duration * 1000),
+      }
     end
 
-    local png_path = output_dir .. "/" .. tag.name .. ".png"
+    local png_path = app.fs.joinPath(output_dir, tag.name .. ".png")
     sheet:saveAs(png_path)
-    exported[#exported + 1] = {
+    local entry = {
       tag = tag.name,
       path = png_path,
       frames = fc,
     }
+
+    -- Write the per-tag sheet JSON that the `json` flag advertised (was read but
+    -- never used before).
+    if export_json then
+      local meta = {
+        tag = tag.name,
+        sheet = png_path,
+        frame_width = fw,
+        frame_height = fh,
+        sheet_type = sheet_type_str,
+        loop = (tag.repeats == 0),
+        direction = enum_util.ani_dir_name(tag.aniDir),
+        frames = frames_meta,
+      }
+      local json_path = app.fs.joinPath(output_dir, tag.name .. ".json")
+      local ok_enc, encoded = pcall(function() return json.encode(meta) end)
+      if ok_enc and encoded then
+        local okw = base.write_text_file(json_path, encoded)
+        if okw then entry.json_path = json_path end
+      end
+    end
+
+    exported[#exported + 1] = entry
   end
 
   return base.success({ exported = exported, count = #exported })
@@ -3891,7 +3988,10 @@ function godot_cmds.sync_to_godot_project(params)
   end
   local scale = base.optional_number(params, "scale", 1)
 
-  local full_dir = app.fs.joinPath(godot_path, target_dir)
+  -- target_dir may contain "/" (e.g. "assets/sprites"); normalize so the
+  -- filesystem path uses a single consistent separator. The res:// path below
+  -- keeps forward slashes (Godot's convention).
+  local full_dir = app.fs.normalizePath(app.fs.joinPath(godot_path, target_dir))
   if not app.fs.isDirectory(full_dir) then
     app.fs.makeAllDirectories(full_dir)
   end
@@ -5340,6 +5440,30 @@ function advanced_cmds.define_autotile_rules(params)
   })
 end
 
+-- Read back the autotile rules stored by define_autotile_rules. Without this
+-- the rules were write-only (persisted to sprite.data but consumed by nothing).
+function advanced_cmds.get_autotile_rules(params)
+  local sprite, err = base.get_sprite()
+  if err then return err end
+
+  if not sprite.data or sprite.data == "" then
+    return base.success({ defined = false })
+  end
+  local ok_dec, decoded = pcall(function() return json.decode(sprite.data) end)
+  if not ok_dec or decoded == nil or decoded.autotile_type == nil then
+    return base.success({ defined = false })
+  end
+  return base.success({
+    defined = true,
+    autotile_type = decoded.autotile_type,
+    tile_size = decoded.tile_size,
+    columns = decoded.columns,
+    rows = decoded.rows,
+    tile_count = decoded.tile_count,
+    rules = decoded.rules,
+  })
+end
+
 -- 12. set_lospec_palette
 function advanced_cmds.set_lospec_palette(params)
   local sprite, err = base.get_sprite()
@@ -5460,33 +5584,40 @@ end
 
 -- 13. copy_between_sprites
 function advanced_cmds.copy_between_sprites(params)
-  local src_filename, e1 = base.require_string(params, "source_filename")
-  if e1 then return e1 end
-  local tgt_filename, e2 = base.require_string(params, "target_filename")
-  if e2 then return e2 end
   local src_layer_name, e3 = base.require_string(params, "source_layer")
   if e3 then return e3 end
   local tgt_layer_name = base.optional_string(params, "target_layer", nil)
   local frame_num = base.optional_number(params, "frame", 1)
 
-  -- Find source and target sprites among open sprites
+  -- Prefer stable ids (source_id/target_id); fall back to filenames.
   local src_sprite, tgt_sprite
-  for i = 1, #app.sprites do
-    local s = app.sprites[i]
-    local fn = app.fs.fileTitle(s.filename) .. "." .. app.fs.fileExtension(s.filename)
-    if s.filename == src_filename or fn == src_filename or app.fs.fileTitle(s.filename) == src_filename then
-      src_sprite = s
+  if params.source_id ~= nil or params.target_id ~= nil then
+    local s_err, t_err
+    src_sprite, s_err = base.resolve_sprite({ id = params.source_id, filename = params.source_filename })
+    if s_err then return s_err end
+    tgt_sprite, t_err = base.resolve_sprite({ id = params.target_id, filename = params.target_filename })
+    if t_err then return t_err end
+  else
+    local src_filename, e1 = base.require_string(params, "source_filename")
+    if e1 then return e1 end
+    local tgt_filename, e2 = base.require_string(params, "target_filename")
+    if e2 then return e2 end
+    for i = 1, #app.sprites do
+      local s = app.sprites[i]
+      local fn = app.fs.fileTitle(s.filename) .. "." .. app.fs.fileExtension(s.filename)
+      if s.filename == src_filename or fn == src_filename or app.fs.fileTitle(s.filename) == src_filename then
+        src_sprite = s
+      end
+      if s.filename == tgt_filename or fn == tgt_filename or app.fs.fileTitle(s.filename) == tgt_filename then
+        tgt_sprite = s
+      end
     end
-    if s.filename == tgt_filename or fn == tgt_filename or app.fs.fileTitle(s.filename) == tgt_filename then
-      tgt_sprite = s
+    if not src_sprite then
+      return base.error(-32000, "Source sprite not found: " .. src_filename)
     end
-  end
-
-  if not src_sprite then
-    return base.error(-32000, "Source sprite not found: " .. src_filename)
-  end
-  if not tgt_sprite then
-    return base.error(-32000, "Target sprite not found: " .. tgt_filename)
+    if not tgt_sprite then
+      return base.error(-32000, "Target sprite not found: " .. tgt_filename)
+    end
   end
 
   -- Find source layer
@@ -5687,6 +5818,7 @@ local function load_commands()
   handlers["load_reference_image"] = advanced_cmds.load_reference_image
   handlers["generate_animation_player_tres"] = advanced_cmds.generate_animation_player_tres
   handlers["define_autotile_rules"] = advanced_cmds.define_autotile_rules
+  handlers["get_autotile_rules"] = advanced_cmds.get_autotile_rules
   handlers["set_lospec_palette"] = advanced_cmds.set_lospec_palette
   handlers["copy_between_sprites"] = advanced_cmds.copy_between_sprites
 
@@ -5794,6 +5926,15 @@ local function advance_port()
   end
 end
 
+-- Each connect() bumps the generation and captures it in the socket's own
+-- closure. When the server replaces an old client, that old socket eventually
+-- fires CLOSE — without this guard the shared `ws`/`connected` state for the
+-- NEW, healthy socket would be wiped, triggering a self-sustaining
+-- reconnect/close storm. Stale sockets ignore their own events and only ever
+-- close themselves, never the shared `ws`.
+local generation = 0
+local stale_retries = 0
+
 local function connect()
   -- Destroy old connection completely
   if ws then
@@ -5802,35 +5943,45 @@ local function connect()
   end
   connected = false
   last_activity = os.time()
+  generation = generation + 1
+  local my_gen = generation
 
   local url = "ws://127.0.0.1:" .. port
   print("[MCP] Connecting to " .. url .. "...")
 
-  ws = WebSocket {
+  local sock
+  sock = WebSocket {
     url = url,
     deflate = false,
     onreceive = function(mt, data, err)
+      if my_gen ~= generation then
+        -- Event from a socket that has already been superseded; ignore it and
+        -- make sure it is fully closed.
+        pcall(function() sock:close() end)
+        return
+      end
       last_activity = os.time()
       if mt == WebSocketMessageType.OPEN then
         connected = true
+        stale_retries = 0
         print("[MCP] Connected to MCP server")
       elseif mt == WebSocketMessageType.TEXT then
         on_message(data)
       elseif mt == WebSocketMessageType.CLOSE then
         connected = false
         print("[MCP] Disconnected from MCP server")
-        -- Destroy ws so health check creates a fresh one
-        if ws then pcall(function() ws:close() end) end
-        ws = nil
+        pcall(function() sock:close() end)
+        if ws == sock then ws = nil end
       elseif mt == WebSocketMessageType.ERROR then
         connected = false
         print("[MCP] WebSocket error: " .. tostring(err))
-        if ws then pcall(function() ws:close() end) end
-        ws = nil
+        pcall(function() sock:close() end)
+        if ws == sock then ws = nil end
       end
     end
   }
-  ws:connect()
+  ws = sock
+  sock:connect()
 end
 
 ----------------------------------------------------------------------
@@ -5849,20 +6000,31 @@ local function start_health_check()
       local stale = (now - last_activity) > STALE_SECONDS
       if connected then
         -- Server pings keep last_activity fresh; if it goes stale the peer
-        -- vanished without a CLOSE/ERROR event — force a reconnect.
+        -- vanished without a CLOSE/ERROR event — reconnect on the SAME port
+        -- (the established server almost always still owns it; under WSL
+        -- mirrored networking a dead-port connect hangs instead of erroring, so
+        -- blindly rotating ports here would drift away from a live server).
+        -- Only rotate after several consecutive stale cycles, in case the
+        -- server genuinely moved.
         if stale then
-          print("[MCP] Connection stale, forcing reconnect")
+          stale_retries = stale_retries + 1
+          if stale_retries >= 3 then
+            print("[MCP] Connection stale repeatedly, trying next port")
+            advance_port()
+            stale_retries = 0
+          else
+            print("[MCP] Connection stale, reconnecting (same port)")
+          end
           if ws then pcall(function() ws:close() end) end
           ws = nil
           connected = false
-          advance_port()
           connect()
         end
       elseif not ws then
         connect()
       elseif stale then
-        -- Stuck mid-connect (no OPEN and no CLOSE/ERROR): drop it and try the
-        -- next port in the range.
+        -- Stuck mid-connect while hunting (no OPEN, no CLOSE/ERROR): rotate to
+        -- find a listening server.
         print("[MCP] Connect attempt stalled, trying next port")
         pcall(function() ws:close() end)
         ws = nil
@@ -5882,6 +6044,11 @@ function init(plugin)
 
   if plugin.preferences and plugin.preferences.port then
     port = plugin.preferences.port
+  end
+  -- Clamp a stale/out-of-range inherited preference back into the scan range so
+  -- we never start hunting from a port that can never be reached.
+  if type(port) ~= "number" or port < PORT_MIN or port > PORT_MAX then
+    port = DEFAULT_PORT
   end
 
   load_commands()
