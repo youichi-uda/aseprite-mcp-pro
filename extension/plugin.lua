@@ -53,7 +53,7 @@ local RECONNECT_INTERVAL_MS = 3000
 -- If no message (incl. server pings) arrives within this window, treat the
 -- connection as dead and force a reconnect even if no CLOSE/ERROR event fired.
 local STALE_SECONDS = 20
-local VERSION = "1.2.2"
+local VERSION = "1.3.0"
 
 -- State
 local ws = nil
@@ -62,6 +62,40 @@ local handlers = {}
 local reconnect_timer = nil
 local port = DEFAULT_PORT
 local last_activity = 0
+local plugin_ref = nil
+
+----------------------------------------------------------------------
+-- Logging
+-- print() opens Aseprite's Console window over the canvas, so routine
+-- messages (connect/reconnect/stale cycles) must never go through it by
+-- default. Every message lands in a small ring buffer (exposed through
+-- get_server_info.recent_log and the Status dialog); it is echoed to the
+-- console only when the user opts into "verbose logging" in MCP Pro: Settings.
+----------------------------------------------------------------------
+local LOG_MAX_LINES = 50
+local log_lines = {}
+local verbose_logging = false
+
+local function log(msg)
+  local line = os.date("%H:%M:%S") .. " " .. tostring(msg)
+  log_lines[#log_lines + 1] = line
+  while #log_lines > LOG_MAX_LINES do
+    table.remove(log_lines, 1)
+  end
+  if verbose_logging then
+    print("[MCP] " .. tostring(msg))
+  end
+end
+
+local function recent_log()
+  local copy = {}
+  for i, l in ipairs(log_lines) do copy[i] = l end
+  return copy
+end
+
+-- Godot auto-sync state (functions defined further below; declared here so
+-- save_sprite can notify it).
+local autosync = {}
 
 ----------------------------------------------------------------------
 -- JSON (Aseprite built-in)
@@ -466,6 +500,12 @@ function sprite_cmds.open_sprite(params)
   local path, err = base.require_string(params, "path")
   if err then return err end
 
+  -- app.open() on a missing file pops Aseprite's Console ("File not found");
+  -- report it as a normal tool error instead.
+  if not app.fs.isFile(path) then
+    return base.error(-32001, "File not found: " .. path)
+  end
+
   local sprite = app.open(path)
   if not sprite then
     return base.error(-32603, "Failed to open file: " .. path)
@@ -489,27 +529,49 @@ function sprite_cmds.save_sprite(params)
   -- When true, adopt the new filename (real Save As) so the sprite is no longer
   -- the ambiguous "Sprite"; default keeps the historical save-copy behaviour.
   local rename = base.optional_bool(params, "rename", false)
+  -- Lua's Sprite:saveAs()/saveCopyAs() do not fire the sprite 'save' event,
+  -- so the Godot auto-sync is triggered explicitly after the sprite's own file
+  -- was written (suppressing the event path in case a future Aseprite does
+  -- fire it, so the export never runs twice).
   if path then
     if app.fs.filePath(path) ~= "" and not app.fs.isDirectory(app.fs.filePath(path)) then
       app.fs.makeAllDirectories(app.fs.filePath(path))
     end
-    if rename then
-      sprite:saveAs(path)
-    else
-      sprite:saveCopyAs(path)
+    autosync.suppress = (autosync.suppress or 0) + 1
+    local ok_save, save_err = pcall(function()
+      if rename then
+        sprite:saveAs(path)
+      else
+        sprite:saveCopyAs(path)
+      end
+    end)
+    autosync.suppress = autosync.suppress - 1
+    if not ok_save then
+      return base.error(-32603, "Save failed: " .. tostring(save_err))
     end
     local resolved, exists, rewritten = base.resolve_saved_path(path)
+    local sync = nil
+    if rename or autosync.same_path(resolved, sprite.filename) then
+      sync = autosync.after_save(sprite, "save_sprite")
+    end
     return base.success({
       filename = resolved,
       requested_path = path,
       exists = exists,
       path_rewritten = rewritten,
       saved_as_copy = not rename,
+      autosync = sync,
     })
   elseif sprite.filename and sprite.filename ~= "" and sprite.filename ~= "Sprite" then
-    sprite:saveAs(sprite.filename)
+    autosync.suppress = (autosync.suppress or 0) + 1
+    local ok_save, save_err = pcall(function() sprite:saveAs(sprite.filename) end)
+    autosync.suppress = autosync.suppress - 1
+    if not ok_save then
+      return base.error(-32603, "Save failed: " .. tostring(save_err))
+    end
     local resolved, exists = base.resolve_saved_path(sprite.filename)
-    return base.success({ filename = resolved, exists = exists })
+    local sync = autosync.after_save(sprite, "save_sprite")
+    return base.success({ filename = resolved, exists = exists, autosync = sync })
   else
     return base.error_invalid_params(
       "Sprite has no filename. Please provide a 'path' parameter to save to.")
@@ -809,7 +871,7 @@ function layer_cmds.add_layer(params)
     elseif layer_type == "tilemap" then
       -- sprite:newLayer() cannot create a tilemap layer; the NewLayer command
       -- can. The created layer becomes app.layer.
-      app.command.NewLayer { tilemap = true }
+      app.command.NewLayer { tilemap = true, gridBounds = sprite.gridBounds }
       layer = app.layer
     else
       layer = sprite:newLayer()
@@ -2486,6 +2548,90 @@ function palette_cmds.set_bg_color(params)
   return base.success({ color = color_hex })
 end
 
+-- pick_color: sample the composited sprite (all visible layers) at x,y.
+-- On Aseprite 1.3.18+ (API 40) this uses app.useTool{ tool="eyedropper" },
+-- which is exactly what the Eyedropper tool picks; on older versions it
+-- composites the frame in Lua and reads the pixel. Optionally sets FG/BG.
+function palette_cmds.pick_color(params)
+  local sprite, err = base.get_sprite()
+  if err then return err end
+
+  local x, e1 = base.require_number(params, "x")
+  if e1 then return e1 end
+  local y, e2 = base.require_number(params, "y")
+  if e2 then return e2 end
+  x = base.to_int(x)
+  y = base.to_int(y)
+  local frame, e3 = base.get_target_frame(sprite, params)
+  if e3 then return e3 end
+  local set_as = base.optional_string(params, "set_as", "none")
+  if set_as ~= "none" and set_as ~= "fg" and set_as ~= "bg" then
+    return base.error_invalid_params("set_as must be 'none', 'fg' or 'bg'")
+  end
+  local method = base.optional_string(params, "method", "auto")
+
+  if x < 0 or y < 0 or x >= sprite.width or y >= sprite.height then
+    return base.error_invalid_params(string.format(
+      "Point (%d, %d) is outside the canvas (%dx%d)", x, y, sprite.width, sprite.height))
+  end
+
+  local color = nil
+  local used = nil
+
+  local eyedropper_ok = (app.apiVersion or 0) >= 40
+  if method ~= "composite" and eyedropper_ok then
+    -- The eyedropper always writes FG (left button) or BG (right button);
+    -- remember both so set_as="none" leaves the user's colors untouched.
+    local old_fg, old_bg = app.fgColor, app.bgColor
+    local ok, c = pcall(function()
+      return app.useTool {
+        tool = "eyedropper",
+        points = { Point(x, y) },
+        frame = frame,
+        button = (set_as == "bg") and MouseButton.RIGHT or MouseButton.LEFT,
+      }
+    end)
+    if ok and c ~= nil and type(c) == "userdata" then
+      local okc = pcall(function() local _ = c.red + c.green + c.blue + c.alpha end)
+      if okc then
+        color = Color(c.red, c.green, c.blue, c.alpha)
+        used = "eyedropper"
+      end
+    end
+    if set_as ~= "fg" then app.fgColor = old_fg end
+    if set_as ~= "bg" then app.bgColor = old_bg end
+    if not color then
+      log("pick_color: eyedropper unavailable, using composite fallback: " .. tostring(c))
+    end
+  end
+
+  if not color then
+    if method == "eyedropper" and not eyedropper_ok then
+      return base.error(-32001,
+        "method 'eyedropper' requires Aseprite 1.3.18+ (API 40); current API is " .. tostring(app.apiVersion),
+        { suggestion = "Use method 'auto' or 'composite'" })
+    end
+    local img = Image(ImageSpec { width = sprite.width, height = sprite.height,
+      colorMode = ColorMode.RGB, transparentColor = 0 })
+    img:clear()
+    img:drawSprite(sprite, frame.frameNumber)
+    local pv = img:getPixel(x, y)
+    color = Color(app.pixelColor.rgbaR(pv), app.pixelColor.rgbaG(pv),
+      app.pixelColor.rgbaB(pv), app.pixelColor.rgbaA(pv))
+    used = "composite"
+    if set_as == "fg" then app.fgColor = color end
+    if set_as == "bg" then app.bgColor = color end
+  end
+
+  return base.success({
+    x = x, y = y, frame = frame.frameNumber,
+    color = color_util.to_hex8(color),
+    r = color.red, g = color.green, b = color.blue, a = color.alpha,
+    set_as = set_as,
+    method = used,
+  })
+end
+
 function palette_cmds.generate_palette_from_sprite(params)
   local sprite, err = base.get_sprite()
   if err then return err end
@@ -2970,7 +3116,10 @@ function tilemap_cmds.create_tilemap_layer(params)
   app.transaction("Create Tilemap Layer", function()
     -- NewLayer{tilemap=true} creates the tilemap layer directly. The previous
     -- sprite:newLayer() call left an orphan empty layer behind on every call.
-    app.command.NewLayer { tilemap = true }
+    -- gridBounds is passed explicitly: without it NewLayer takes the grid of
+    -- the active site (e.g. the active tilemap layer's tileset), so a second
+    -- tilemap layer silently inherited the previous tile size.
+    app.command.NewLayer { tilemap = true, gridBounds = Rectangle(0, 0, tile_width, tile_height) }
     layer = app.layer
     if name and layer then
       layer.name = name
@@ -3151,6 +3300,280 @@ function tilemap_cmds.get_tilemap_info(params)
     tile_height = tileset and tileset.grid.tileSize.height or 0,
     tile_count = tileset and #tileset or 0,
     used_tile_indices = used_tiles,
+  })
+end
+
+----------------------------------------------------------------------
+-- Tile-rect helpers (copy_tiles / fill_tiles)
+-- Coordinates are tilemap grid cells relative to the tileset grid origin,
+-- i.e. the same cells set_tile / get_tile address for a cel at the origin.
+-- A tilemap cel can sit at an offset (Aseprite moves it when the map grows
+-- left/up), so the cel position is converted to a cell offset here.
+-- Tile values keep their flip flags (high bits) — only the index is remapped.
+----------------------------------------------------------------------
+local tile_util = {}
+
+function tile_util.require_tilemap(sprite, name)
+  local layer = base.find_layer(sprite, name)
+  if not layer then return nil, base.error_layer_not_found(name) end
+  if not layer.isTilemap then
+    return nil, base.error(-32001, "Layer is not a tilemap: " .. tostring(name))
+  end
+  if not layer.tileset then
+    return nil, base.error(-32001, "No tileset found for layer: " .. tostring(name))
+  end
+  return layer, nil
+end
+
+function tile_util.grid(layer)
+  local g = layer.tileset.grid
+  return g.tileSize.width, g.tileSize.height, g.origin.x, g.origin.y
+end
+
+-- Cell offset (col0,row0) of a tilemap cel's image.
+function tile_util.cel_offset(layer, cel)
+  local tw, th, ox, oy = tile_util.grid(layer)
+  return math.floor((cel.position.x - ox) / tw), math.floor((cel.position.y - oy) / th)
+end
+
+-- Raw tile value (index + flags) at a grid cell; 0 (empty) outside the cel.
+function tile_util.get(layer, cel, col, row)
+  if not cel then return 0 end
+  local c0, r0 = tile_util.cel_offset(layer, cel)
+  local lx, ly = col - c0, row - r0
+  local img = cel.image
+  if lx < 0 or ly < 0 or lx >= img.width or ly >= img.height then return 0 end
+  return img:getPixel(lx, ly)
+end
+
+-- Ensure the layer has a tilemap cel on `frame` covering the cell rect;
+-- creates or grows it (also to the left/up). Must run inside a transaction.
+function tile_util.ensure_cel(sprite, layer, frame, col, row, w, h)
+  local tw, th, ox, oy = tile_util.grid(layer)
+  local cel = layer:cel(frame.frameNumber)
+  if not cel then
+    local c0 = math.min(0, col)
+    local r0 = math.min(0, row)
+    local c1 = math.max(math.ceil(sprite.width / tw), col + w) - 1
+    local r1 = math.max(math.ceil(sprite.height / th), row + h) - 1
+    local img = Image(ImageSpec { width = c1 - c0 + 1, height = r1 - r0 + 1, colorMode = ColorMode.TILEMAP })
+    img:clear(0)
+    return sprite:newCel(layer, frame, img, Point(ox + c0 * tw, oy + r0 * th))
+  end
+  local c0, r0 = tile_util.cel_offset(layer, cel)
+  local cw, ch = cel.image.width, cel.image.height
+  local nc0 = math.min(c0, col)
+  local nr0 = math.min(r0, row)
+  local nc1 = math.max(c0 + cw, col + w) - 1
+  local nr1 = math.max(r0 + ch, row + h) - 1
+  if nc0 == c0 and nr0 == r0 and nc1 == c0 + cw - 1 and nr1 == r0 + ch - 1 then
+    return cel
+  end
+  local ni = Image(ImageSpec { width = nc1 - nc0 + 1, height = nr1 - nr0 + 1, colorMode = ColorMode.TILEMAP })
+  ni:clear(0)
+  -- Copy cell values explicitly (no blending semantics for tile values).
+  local old = cel.image
+  local dx, dy = c0 - nc0, r0 - nr0
+  for y = 0, ch - 1 do
+    for x = 0, cw - 1 do
+      ni:putPixel(x + dx, y + dy, old:getPixel(x, y))
+    end
+  end
+  cel.image = ni
+  cel.position = Point(ox + nc0 * tw, oy + nr0 * th)
+  return cel
+end
+
+function tile_util.put(layer, cel, col, row, value)
+  local c0, r0 = tile_util.cel_offset(layer, cel)
+  cel.image:putPixel(col - c0, row - r0, value)
+end
+
+local function tile_rect_params(params, prefix_col, prefix_row)
+  local col, e1 = base.require_number(params, prefix_col)
+  if e1 then return nil, nil, nil, nil, e1 end
+  local row, e2 = base.require_number(params, prefix_row)
+  if e2 then return nil, nil, nil, nil, e2 end
+  local w = base.to_int(params.width, 1)
+  local h = base.to_int(params.height, 1)
+  if w < 1 or h < 1 then
+    return nil, nil, nil, nil, base.error_invalid_params("width and height must be >= 1")
+  end
+  if w * h > 1048576 then
+    return nil, nil, nil, nil, base.error_invalid_params("tile rect too large (max 1048576 cells)")
+  end
+  return base.to_int(col), base.to_int(row), w, h, nil
+end
+
+local TILE_FLIP_X = 0x80000000
+local TILE_FLIP_Y = 0x40000000
+local TILE_FLIP_D = 0x20000000
+
+function tilemap_cmds.fill_tiles(params)
+  local sprite, err = base.get_sprite()
+  if err then return err end
+  local layer_name, e1 = base.require_string(params, "layer")
+  if e1 then return e1 end
+  local layer, e2 = tile_util.require_tilemap(sprite, layer_name)
+  if e2 then return e2 end
+  local col, row, w, h, e3 = tile_rect_params(params, "col", "row")
+  if e3 then return e3 end
+  local tile_index, e4 = base.require_number(params, "tile_index")
+  if e4 then return e4 end
+  tile_index = base.to_int(tile_index)
+  if tile_index < 0 then return base.error_invalid_params("tile_index must be >= 0") end
+  local frame, e5 = base.get_target_frame(sprite, params)
+  if e5 then return e5 end
+
+  local flags = 0
+  if base.optional_bool(params, "flip_x", false) then flags = flags | TILE_FLIP_X end
+  if base.optional_bool(params, "flip_y", false) then flags = flags | TILE_FLIP_Y end
+  if base.optional_bool(params, "flip_d", false) then flags = flags | TILE_FLIP_D end
+  local value = app.pixelColor.tile(tile_index, flags)
+
+  local tiles_added = 0
+  app.transaction("Fill Tiles", function()
+    local tileset = layer.tileset
+    while #tileset <= tile_index do
+      sprite:newTile(tileset)
+      tiles_added = tiles_added + 1
+    end
+    local cel = tile_util.ensure_cel(sprite, layer, frame, col, row, w, h)
+    for r = row, row + h - 1 do
+      for c = col, col + w - 1 do
+        tile_util.put(layer, cel, c, r, value)
+      end
+    end
+  end)
+
+  return base.success({
+    layer = layer_name, frame = frame.frameNumber,
+    col = col, row = row, width = w, height = h,
+    tile_index = tile_index, cells = w * h,
+    empty_tiles_added = tiles_added,
+  })
+end
+
+function tilemap_cmds.copy_tiles(params)
+  local sprite, err = base.get_sprite()
+  if err then return err end
+
+  local src_name, e1 = base.require_string(params, "layer")
+  if e1 then return e1 end
+  local src_layer, e2 = tile_util.require_tilemap(sprite, src_name)
+  if e2 then return e2 end
+  local col, row, w, h, e3 = tile_rect_params(params, "col", "row")
+  if e3 then return e3 end
+  local src_frame, e4 = base.get_target_frame(sprite, params)
+  if e4 then return e4 end
+
+  local dst_name = base.optional_string(params, "target_layer", src_name)
+  local dst_layer, e5 = tile_util.require_tilemap(sprite, dst_name)
+  if e5 then return e5 end
+  local dst_frame = src_frame
+  if params.target_frame ~= nil then
+    local tf = base.to_int(params.target_frame)
+    if tf < 1 or tf > #sprite.frames then
+      return base.error_invalid_params(string.format("target_frame %d out of range (1-%d)", tf, #sprite.frames))
+    end
+    dst_frame = sprite.frames[tf]
+  end
+  local tcol = base.to_int(params.target_col, col)
+  local trow = base.to_int(params.target_row, row)
+  local add_missing = base.optional_bool(params, "add_missing_tiles", true)
+  local skip_empty = base.optional_bool(params, "skip_empty", false)
+
+  local src_ts = src_layer.tileset
+  local dst_ts = dst_layer.tileset
+  local same_tileset = (src_ts == dst_ts)
+  local stw, sth = tile_util.grid(src_layer)
+  local dtw, dth = tile_util.grid(dst_layer)
+  if not same_tileset and (stw ~= dtw or sth ~= dth) then
+    return base.error(-32001, string.format(
+      "Tile sizes differ (%dx%d vs %dx%d); cannot remap tiles between these tilesets",
+      stw, sth, dtw, dth))
+  end
+
+  -- Read the source block first (source and target may overlap / be the
+  -- same cel).
+  local src_cel = src_layer:cel(src_frame.frameNumber)
+  local block = {}
+  for r = 0, h - 1 do
+    for c = 0, w - 1 do
+      block[r * w + c] = tile_util.get(src_layer, src_cel, col + c, row + r)
+    end
+  end
+
+  local remap = {}          -- src index -> dst index
+  local unmatched = {}      -- src indices with no match (add_missing=false)
+  local added = 0
+  local copied = 0
+  local err_out = nil
+
+  app.transaction("Copy Tiles", function()
+    local function map_index(si)
+      if si == 0 or same_tileset then return si end
+      if remap[si] ~= nil then return remap[si] end
+      local simg = src_ts:getTile(si)
+      local found = nil
+      if simg then
+        for di = 1, #dst_ts - 1 do
+          local dimg = dst_ts:getTile(di)
+          if dimg and dimg:isEqual(simg) then found = di; break end
+        end
+        if not found and add_missing then
+          local t = sprite:newTile(dst_ts)
+          t.image = simg
+          found = t.index
+          added = added + 1
+        end
+      end
+      if not found then
+        unmatched[#unmatched + 1] = si
+        found = 0
+      end
+      remap[si] = found
+      return found
+    end
+
+    local dst_cel = tile_util.ensure_cel(sprite, dst_layer, dst_frame, tcol, trow, w, h)
+    for r = 0, h - 1 do
+      for c = 0, w - 1 do
+        local v = block[r * w + c]
+        local si = app.pixelColor.tileI(v)
+        if not (skip_empty and si == 0) then
+          local di = map_index(si)
+          if si ~= 0 and di == 0 then
+            -- unmatched: leave target empty
+            tile_util.put(dst_layer, dst_cel, tcol + c, trow + r, 0)
+          else
+            tile_util.put(dst_layer, dst_cel, tcol + c, trow + r,
+              app.pixelColor.tile(di, app.pixelColor.tileF(v)))
+          end
+          copied = copied + 1
+        end
+      end
+    end
+  end)
+  if err_out then return err_out end
+
+  local remap_out = {}
+  if not same_tileset then
+    for si, di in pairs(remap) do
+      if si ~= 0 then remap_out[#remap_out + 1] = { source = si, target = di } end
+    end
+    table.sort(remap_out, function(a, b) return a.source < b.source end)
+  end
+
+  return base.success({
+    source = { layer = src_name, frame = src_frame.frameNumber, col = col, row = row },
+    target = { layer = dst_name, frame = dst_frame.frameNumber, col = tcol, row = trow },
+    width = w, height = h,
+    cells_written = copied,
+    same_tileset = same_tileset,
+    remapped = remap_out,
+    tiles_added = added,
+    unmatched_tiles = unmatched,
   })
 end
 
@@ -3516,106 +3939,275 @@ end
 ----------------------------------------------------------------------
 local godot_cmds = {}
 
--- Helper: build animation data from tags
-local function build_animation_data(sprite, sheet_type, columns)
-  local frame_count = #sprite.frames
-  local fw = sprite.width
-  local fh = sprite.height
+----------------------------------------------------------------------
+-- Godot export core. Shared by export_for_godot, sync_to_godot_project,
+-- batch_export_for_godot, generate_spriteframes_tres, get_animation_data,
+-- the Godot auto-sync (sprite 'save' event) and the "Godot SpriteFrames"
+-- custom file format, so every path produces identical resources.
+----------------------------------------------------------------------
+local godot_export = {}
 
-  local function frame_region(idx)
-    local col, row
-    if sheet_type == "horizontal" then
-      col = idx
-      row = 0
-    elseif sheet_type == "vertical" then
-      col = 0
-      row = idx
-    elseif sheet_type == "rows" or sheet_type == "columns" then
-      local cols = columns or frame_count
-      col = idx % cols
-      row = math.floor(idx / cols)
-    else
-      col = idx
-      row = 0
+local VALID_SHEET_TYPES = { horizontal = true, vertical = true, rows = true, columns = true }
+
+-- Validate/normalize the export options shared by every Godot exporter.
+-- Returns opts, err.
+function godot_export.parse_options(params)
+  params = params or {}
+  local o = {}
+  o.sheet_type = base.optional_string(params, "sheet_type", "horizontal")
+  if not VALID_SHEET_TYPES[o.sheet_type] then
+    return nil, base.error_invalid_params("Invalid sheet_type '" .. tostring(o.sheet_type) ..
+      "' (expected horizontal, vertical, rows or columns)")
+  end
+  if params.columns ~= nil then o.columns = base.to_int(params.columns) end
+  if params.rows ~= nil then o.rows = base.to_int(params.rows) end
+  if o.columns ~= nil and o.columns < 1 then
+    return nil, base.error_invalid_params("columns must be >= 1")
+  end
+  if o.rows ~= nil and o.rows < 1 then
+    return nil, base.error_invalid_params("rows must be >= 1")
+  end
+  o.scale = base.optional_number(params, "scale", 1)
+  if o.scale <= 0 or o.scale > 64 then
+    return nil, base.error_invalid_params("scale must be > 0 and <= 64")
+  end
+  o.trim = base.optional_bool(params, "trim", false)
+  return o, nil
+end
+
+-- Grid for the sheet layout. Returns cols, rows, column_major.
+--   horizontal: one row        vertical: one column
+--   rows:    row-major grid, `columns` cells per row (default ceil(sqrt(n)))
+--   columns: column-major grid, `rows` cells per column (default ceil(sqrt(n)))
+-- (Same meaning as Aseprite's own "By Rows" / "By Columns" sheet types.)
+local function grid_layout(sheet_type, count, columns, rows)
+  count = math.max(count, 1)
+  if sheet_type == "vertical" then
+    return 1, count, false
+  elseif sheet_type == "rows" then
+    local c = math.min(columns or math.ceil(math.sqrt(count)), count)
+    return c, math.ceil(count / c), false
+  elseif sheet_type == "columns" then
+    local r = math.min(rows or math.ceil(math.sqrt(count)), count)
+    return math.ceil(count / r), r, true
+  end
+  return count, 1, false
+end
+
+-- 0-based cell index -> col, row
+local function cell_pos(k, cols, rows, column_major)
+  if column_major then
+    return math.floor(k / rows), k % rows
+  end
+  return k % cols, math.floor(k / cols)
+end
+
+-- Godot's SpriteFrames has no playback direction, so tag directions are
+-- emulated by expanding the frame list:
+--   forward           a..b
+--   reverse           b..a
+--   ping_pong         a..b, then b-1..a+1 (the endpoints are not repeated)
+--   ping_pong_reverse b..a, then a+1..b-1
+function godot_export.frame_sequence(from, to, dir_name)
+  local seq = {}
+  if dir_name == "reverse" or dir_name == "ping_pong_reverse" then
+    for i = to, from, -1 do seq[#seq + 1] = i end
+    if dir_name == "ping_pong_reverse" then
+      for i = from + 1, to - 1 do seq[#seq + 1] = i end
     end
-    return { x = col * fw, y = row * fh, w = fw, h = fh }
+  else
+    for i = from, to do seq[#seq + 1] = i end
+    if dir_name == "ping_pong" then
+      for i = to - 1, from + 1, -1 do seq[#seq + 1] = i end
+    end
+  end
+  return seq
+end
+
+-- Build the frame regions (+ optional sheet image) for a sprite.
+-- Frames are composited (all visible layers) into RGBA, scaled with
+-- nearest-neighbour when opts.scale ~= 1, and — with opts.trim — cropped to
+-- their opaque bounds. Trimmed frames keep their original placement through
+-- the AtlasTexture `margin` (Godot restores the full frame size from it), so
+-- trimming never shifts the animation.
+-- Returns data, sheet_image (sheet_image only when want_image is true).
+function godot_export.build(sprite, opts, want_image)
+  local fc = #sprite.frames
+  local fw, fh = sprite.width, sprite.height
+  local s = opts.scale or 1
+  local sw = math.max(1, math.floor(fw * s + 0.5))
+  local sh = math.max(1, math.floor(fh * s + 0.5))
+
+  local need_render = want_image or opts.trim
+  local frame_imgs, bounds = {}, {}
+  local cw, ch = sw, sh
+
+  if need_render then
+    if opts.trim then cw, ch = 1, 1 end
+    for i = 1, fc do
+      local img = Image(ImageSpec { width = fw, height = fh, colorMode = ColorMode.RGB, transparentColor = 0 })
+      img:clear()
+      img:drawSprite(sprite, i)
+      if sw ~= fw or sh ~= fh then
+        img:resize(sw, sh)
+      end
+      local b = Rectangle(0, 0, sw, sh)
+      if opts.trim then
+        b = img:shrinkBounds()
+        if b.isEmpty then
+          -- Fully transparent frame: keep a 1x1 transparent region; the
+          -- margin restores the full frame size.
+          b = Rectangle(0, 0, 1, 1)
+        end
+        img = Image(img, b)
+      end
+      frame_imgs[i] = img
+      bounds[i] = b
+      if b.width > cw then cw = b.width end
+      if b.height > ch then ch = b.height end
+    end
+  end
+
+  local cols, rows, column_major = grid_layout(opts.sheet_type, fc, opts.columns, opts.rows)
+
+  local regions = {}
+  for i = 1, fc do
+    local c, r = cell_pos(i - 1, cols, rows, column_major)
+    local b = bounds[i] or Rectangle(0, 0, sw, sh)
+    local margin = nil
+    if opts.trim and (b.x ~= 0 or b.y ~= 0 or b.width ~= sw or b.height ~= sh) then
+      margin = { x = b.x, y = b.y, w = sw - b.width, h = sh - b.height }
+    end
+    regions[i] = {
+      region = { x = c * cw, y = r * ch, w = b.width, h = b.height },
+      margin = margin,
+    }
+  end
+
+  local sheet = nil
+  if want_image then
+    sheet = Image(ImageSpec { width = cols * cw, height = rows * ch, colorMode = ColorMode.RGB, transparentColor = 0 })
+    sheet:clear()
+    local copy_mode = BlendMode.SRC or BlendMode.NORMAL
+    for i = 1, fc do
+      local reg = regions[i].region
+      sheet:drawImage(frame_imgs[i], Point(reg.x, reg.y), 255, copy_mode)
+    end
+  end
+
+  local function frame_entry(i)
+    return {
+      index = i - 1,
+      region = regions[i].region,
+      margin = regions[i].margin,
+      duration_ms = math.floor(sprite.frames[i].duration * 1000 + 0.5),
+    }
   end
 
   local animations = {}
-
   if #sprite.tags > 0 then
     for _, tag in ipairs(sprite.tags) do
+      local dir = enum_util.ani_dir_name(tag.aniDir)
+      local seq = godot_export.frame_sequence(tag.fromFrame.frameNumber, tag.toFrame.frameNumber, dir)
       local frames = {}
-      for i = tag.fromFrame.frameNumber, tag.toFrame.frameNumber do
-        frames[#frames + 1] = {
-          index = i - 1,
-          region = frame_region(i - 1),
-          duration_ms = math.floor(sprite.frames[i].duration * 1000),
-        }
-      end
+      for _, fi in ipairs(seq) do frames[#frames + 1] = frame_entry(fi) end
+      local repeats = 0
+      pcall(function() repeats = tag.repeats or 0 end)
       animations[#animations + 1] = {
         name = tag.name,
         frames = frames,
-        loop = tag.repeats == 0,
-        direction = enum_util.ani_dir_name(tag.aniDir),
+        loop = repeats == 0,
+        direction = dir,
+        direction_emulated = (dir ~= "forward"),
+        source_frames = tag.toFrame.frameNumber - tag.fromFrame.frameNumber + 1,
       }
     end
   else
     local frames = {}
-    for i = 1, frame_count do
-      frames[i] = {
-        index = i - 1,
-        region = frame_region(i - 1),
-        duration_ms = math.floor(sprite.frames[i].duration * 1000),
-      }
-    end
+    for i = 1, fc do frames[i] = frame_entry(i) end
     animations[1] = {
       name = "default",
       frames = frames,
       loop = true,
       direction = "forward",
+      direction_emulated = false,
+      source_frames = fc,
     }
   end
 
   return {
     sprite_width = fw,
     sprite_height = fh,
-    frame_count = frame_count,
-    sheet_width = (sheet_type == "vertical") and fw or (fw * (columns or frame_count)),
-    sheet_height = (sheet_type == "horizontal") and fh or (fh * math.ceil(frame_count / (columns or frame_count))),
+    frame_width = sw,
+    frame_height = sh,
+    cell_width = cw,
+    cell_height = ch,
+    frame_count = fc,
+    sheet_type = opts.sheet_type,
+    columns = cols,
+    rows = rows,
+    scale = s,
+    trim = opts.trim and true or false,
+    sheet_width = cols * cw,
+    sheet_height = rows * ch,
     animations = animations,
-  }
+  }, sheet
 end
 
--- Helper: generate SpriteFrames .tres content.
+-- Walk up from `dir` looking for project.godot. Returns the root or nil.
+function godot_export.find_project_root(dir)
+  if not dir or dir == "" then return nil end
+  local d = app.fs.normalizePath(dir)
+  for _ = 1, 64 do
+    if app.fs.isFile(app.fs.joinPath(d, "project.godot")) then return d end
+    local parent = app.fs.filePath(d)
+    if not parent or parent == "" or parent == d then return nil end
+    d = parent
+  end
+  return nil
+end
+
+-- res:// path of a file inside a Godot project, or nil when not in one.
+function godot_export.res_path_for(file_path)
+  local norm = app.fs.normalizePath(file_path)
+  local root = godot_export.find_project_root(app.fs.filePath(norm))
+  if not root then return nil end
+  local rel = norm:sub(#root + 1):gsub("\\", "/"):gsub("^/+", "")
+  return "res://" .. rel
+end
+
+-- Generate SpriteFrames .tres content.
 -- Godot 4's SpriteFrames reads only "texture" and "duration" per frame — it has
--- NO "region" key. Regions must come from AtlasTexture sub-resources (one per
--- frame). Animation names are StringNames (&"name") and per-frame "duration" is
--- a multiplier of the animation's "speed" (FPS), not a value in seconds.
+-- NO "region" key. Regions come from AtlasTexture sub-resources (one per
+-- distinct region/margin). Animation names are StringNames (&"name") and
+-- per-frame "duration" is a multiplier of the animation's "speed" (FPS).
 local function generate_tres(texture_res_path, anim_data)
   local tex_id = "1_tex"
 
-  -- Emit one AtlasTexture sub-resource per frame, deduplicating identical
-  -- regions so repeated frames share a sub-resource.
   local sub_lines = {}
   local region_to_id = {}
   local sub_count = 0
-  local function atlas_id_for(r)
+  local function atlas_id_for(r, m)
     local key = string.format("%d_%d_%d_%d", r.x, r.y, r.w, r.h)
+    if m then key = key .. string.format("_m%d_%d_%d_%d", m.x, m.y, m.w, m.h) end
     if region_to_id[key] then return region_to_id[key] end
     local id = "AtlasTexture_" .. sub_count
     region_to_id[key] = id
     sub_count = sub_count + 1
-    sub_lines[#sub_lines + 1] = string.format(
+    local body = string.format(
       '[sub_resource type="AtlasTexture" id="%s"]\natlas = ExtResource("%s")\nregion = Rect2(%d, %d, %d, %d)\n',
       id, tex_id, r.x, r.y, r.w, r.h)
+    if m then
+      body = body .. string.format('margin = Rect2(%d, %d, %d, %d)\n', m.x, m.y, m.w, m.h)
+    end
+    sub_lines[#sub_lines + 1] = body
     return id
   end
 
   local anim_entries = {}
   for _, anim in ipairs(anim_data.animations) do
-    -- Derive FPS (speed) from the animation's frame durations; use the first
-    -- frame's duration as the base so its multiplier is 1.0 (matches Aseprite).
+    -- Derive FPS (speed) from the first frame's duration so its multiplier is
+    -- 1.0 (matches Aseprite timing).
     local base_ms = nil
     for _, f in ipairs(anim.frames) do
       if f.duration_ms and f.duration_ms > 0 then base_ms = f.duration_ms; break end
@@ -3625,17 +4217,18 @@ local function generate_tres(texture_res_path, anim_data)
 
     local frames_arr = {}
     for _, f in ipairs(anim.frames) do
-      local id = atlas_id_for(f.region)
+      local id = atlas_id_for(f.region, f.margin)
       local dur_mult = (f.duration_ms and f.duration_ms > 0) and (f.duration_ms / base_ms) or 1.0
       frames_arr[#frames_arr + 1] = string.format(
         '{"duration": %.3f, "texture": SubResource("%s")}', dur_mult, id)
     end
 
+    local safe_name = tostring(anim.name):gsub('\\', '\\\\'):gsub('"', '\\"')
     anim_entries[#anim_entries + 1] = string.format(
       '{\n"frames": [%s],\n"loop": %s,\n"name": &"%s",\n"speed": %.3f\n}',
       table.concat(frames_arr, ", "),
       anim.loop and "true" or "false",
-      anim.name,
+      safe_name,
       speed)
   end
 
@@ -3656,6 +4249,84 @@ local function generate_tres(texture_res_path, anim_data)
   return table.concat(lines, "\n") .. "\n"
 end
 
+-- Default output base name for a sprite.
+function godot_export.default_name(sprite)
+  local n = sprite.filename and sprite.filename:match("([^/\\]+)%.[^./\\]+$")
+  if not n or n == "" then n = "sprite" end
+  return n
+end
+
+-- Export the sheet PNG + SpriteFrames .tres (+ JSON) for `sprite`.
+-- opts = parse_options() result plus:
+--   output_dir (required), name, texture_path (explicit res:// path),
+--   write_json (default true), texture_fallback ("res" | "relative").
+-- Never saves the source sprite, so it is safe to call from a 'save' event or
+-- from inside a custom file format's onsave.
+-- Returns result_table, nil  or  nil, error_response.
+function godot_export.write(sprite, opts)
+  local output_dir = opts.output_dir
+  if not app.fs.isDirectory(output_dir) then
+    app.fs.makeAllDirectories(output_dir)
+  end
+  local name = opts.name or godot_export.default_name(sprite)
+
+  local png_path = app.fs.joinPath(output_dir, name .. ".png")
+  local tres_path = app.fs.joinPath(output_dir, name .. ".tres")
+  local json_path = app.fs.joinPath(output_dir, name .. ".json")
+
+  local anim_data, sheet = godot_export.build(sprite, opts, true)
+  sheet:saveAs(png_path)
+  if not app.fs.isFile(png_path) then
+    return nil, base.error(-32603, "Failed to write sheet PNG: " .. png_path, { path = png_path })
+  end
+
+  -- Texture reference: explicit res:// path > path inside the detected Godot
+  -- project (project.godot found above output_dir) > fallback.
+  local res_path = opts.texture_path or godot_export.res_path_for(png_path)
+  local res_detected = (opts.texture_path == nil and res_path ~= nil)
+  if not res_path then
+    if opts.texture_fallback == "relative" then
+      res_path = name .. ".png"   -- Godot resolves this relative to the .tres
+    else
+      res_path = "res://" .. name .. ".png"
+    end
+  end
+
+  local ok, werr = base.write_text_file(tres_path, generate_tres(res_path, anim_data))
+  if not ok then return nil, werr end
+
+  local json_written = false
+  if opts.write_json ~= false then
+    local ok_json, encoded = pcall(function() return json.encode(anim_data) end)
+    if ok_json and encoded then
+      json_written = base.write_text_file(json_path, encoded) and true or false
+    end
+  end
+
+  local frames_out = 0
+  for _, a in ipairs(anim_data.animations) do frames_out = frames_out + #a.frames end
+
+  return {
+    png_path = png_path,
+    json_path = json_written and json_path or nil,
+    tres_path = tres_path,
+    texture_res_path = res_path,
+    texture_res_detected = res_detected,
+    animations = #anim_data.animations,
+    total_frames = anim_data.frame_count,
+    animation_frames = frames_out,
+    sheet_type = anim_data.sheet_type,
+    columns = anim_data.columns,
+    rows = anim_data.rows,
+    sheet_width = anim_data.sheet_width,
+    sheet_height = anim_data.sheet_height,
+    frame_width = anim_data.frame_width,
+    frame_height = anim_data.frame_height,
+    scale = anim_data.scale,
+    trim = anim_data.trim,
+  }, nil
+end
+
 function godot_cmds.export_for_godot(params)
   local sprite, err = base.get_sprite()
   if err then return err end
@@ -3663,83 +4334,16 @@ function godot_cmds.export_for_godot(params)
   local output_dir, e1 = base.require_string(params, "output_dir")
   if e1 then return e1 end
 
-  local name = base.optional_string(params, "name", nil)
-  if not name then
-    name = sprite.filename:match("([^/\\]+)%.%w+$") or "sprite"
-  end
+  local opts, oerr = godot_export.parse_options(params)
+  if oerr then return oerr end
+  opts.output_dir = output_dir
+  opts.name = base.optional_string(params, "name", nil)
+  -- Explicit res:// texture path wins; otherwise detect the Godot project.
+  opts.texture_path = base.optional_string(params, "texture_path", nil)
 
-  local sheet_type_str = base.optional_string(params, "sheet_type", "horizontal")
-  local scale = base.optional_number(params, "scale", 1)
-  local trim = base.optional_bool(params, "trim", false)
-  -- Explicit res:// texture path wins; otherwise fall back to project root.
-  local texture_res_override = base.optional_string(params, "texture_path", nil)
-
-  if not app.fs.isDirectory(output_dir) then
-    app.fs.makeAllDirectories(output_dir)
-  end
-
-  local png_path = app.fs.joinPath(output_dir, name .. ".png")
-  local json_path = app.fs.joinPath(output_dir, name .. ".json")
-
-  local fw = sprite.width
-  local fh = sprite.height
-  local fc = #sprite.frames
-
-  local sheet_w, sheet_h
-  if sheet_type_str == "vertical" then
-    sheet_w = fw
-    sheet_h = fh * fc
-  else
-    sheet_w = fw * fc
-    sheet_h = fh
-  end
-
-  local sheet = Image(sheet_w, sheet_h, sprite.colorMode)
-  sheet:clear()
-  for i = 1, fc do
-    local frame_img = Image(sprite.spec)
-    frame_img:drawSprite(sprite, i)
-    local dx, dy
-    if sheet_type_str == "vertical" then
-      dx = 0
-      dy = (i - 1) * fh
-    else
-      dx = (i - 1) * fw
-      dy = 0
-    end
-    for y = 0, fh - 1 do
-      for x = 0, fw - 1 do
-        sheet:putPixel(dx + x, dy + y, frame_img:getPixel(x, y))
-      end
-    end
-  end
-  sheet:saveAs(png_path)
-
-  local anim_data = build_animation_data(sprite, sheet_type_str, nil)
-
-  local res_path = texture_res_override or ("res://" .. name .. ".png")
-  local tres_content = generate_tres(res_path, anim_data)
-  local tres_path = app.fs.joinPath(output_dir, name .. ".tres")
-
-  local ok, werr = base.write_text_file(tres_path, tres_content)
-  if not ok then return werr end
-
-  -- Write the sheet JSON that json_path advertises (was previously never written).
-  local json_written = false
-  local ok_json, encoded = pcall(function() return json.encode(anim_data) end)
-  if ok_json and encoded then
-    local okw = base.write_text_file(json_path, encoded)
-    json_written = okw
-  end
-
-  return base.success({
-    png_path = png_path,
-    json_path = json_written and json_path or nil,
-    tres_path = tres_path,
-    texture_res_path = res_path,
-    animations = #anim_data.animations,
-    total_frames = anim_data.frame_count,
-  })
+  local result, werr = godot_export.write(sprite, opts)
+  if werr then return werr end
+  return base.success(result)
 end
 
 function godot_cmds.export_atlas_texture(params)
@@ -3943,10 +4547,10 @@ function godot_cmds.get_animation_data(params)
   local sprite, err = base.get_sprite()
   if err then return err end
 
-  local sheet_type = base.optional_string(params, "sheet_type", "horizontal")
-  local columns = base.optional_number(params, "columns", nil)
+  local opts, oerr = godot_export.parse_options(params)
+  if oerr then return oerr end
 
-  local data = build_animation_data(sprite, sheet_type, columns)
+  local data = godot_export.build(sprite, opts, false)
   return base.success(data)
 end
 
@@ -3959,10 +4563,12 @@ function godot_cmds.generate_spriteframes_tres(params)
   local output_path, e2 = base.require_string(params, "output_path")
   if e2 then return e2 end
 
-  local sheet_type = base.optional_string(params, "sheet_type", "horizontal")
-  local columns = base.optional_number(params, "columns", nil)
+  local opts, oerr = godot_export.parse_options(params)
+  if oerr then return oerr end
 
-  local anim_data = build_animation_data(sprite, sheet_type, columns)
+  -- Same layout code as export_for_godot, so the regions match a sheet that
+  -- export_for_godot / export_sprite_sheet produced with the same options.
+  local anim_data = godot_export.build(sprite, opts, false)
   local tres_content = generate_tres(texture_path, anim_data)
 
   local ok, werr = base.write_text_file(output_path, tres_content)
@@ -3971,7 +4577,22 @@ function godot_cmds.generate_spriteframes_tres(params)
   return base.success({
     output_path = output_path,
     animations = #anim_data.animations,
+    sheet_width = anim_data.sheet_width,
+    sheet_height = anim_data.sheet_height,
+    columns = anim_data.columns,
+    rows = anim_data.rows,
   })
+end
+
+-- Resolve "<godot_project_path>/<target_dir>" and the matching res:// dir.
+local function godot_target(godot_path, target_dir)
+  target_dir = (target_dir or "assets/sprites"):gsub("\\", "/"):gsub("^/+", ""):gsub("/+$", "")
+  -- target_dir may contain "/" (e.g. "assets/sprites"); normalize so the
+  -- filesystem path uses a single consistent separator. The res:// path keeps
+  -- forward slashes (Godot's convention).
+  local full_dir = app.fs.normalizePath(app.fs.joinPath(godot_path, target_dir))
+  local res_dir = (target_dir == "") and "res://" or ("res://" .. target_dir .. "/")
+  return full_dir, res_dir, target_dir
 end
 
 function godot_cmds.sync_to_godot_project(params)
@@ -3981,45 +4602,29 @@ function godot_cmds.sync_to_godot_project(params)
   local godot_path, e1 = base.require_string(params, "godot_project_path")
   if e1 then return e1 end
 
-  local target_dir = base.optional_string(params, "target_dir", "assets/sprites")
-  local name = base.optional_string(params, "name", nil)
-  if not name then
-    name = sprite.filename:match("([^/\\]+)%.%w+$") or "sprite"
-  end
-  local scale = base.optional_number(params, "scale", 1)
+  local opts, oerr = godot_export.parse_options(params)
+  if oerr then return oerr end
 
-  -- target_dir may contain "/" (e.g. "assets/sprites"); normalize so the
-  -- filesystem path uses a single consistent separator. The res:// path below
-  -- keeps forward slashes (Godot's convention).
-  local full_dir = app.fs.normalizePath(app.fs.joinPath(godot_path, target_dir))
-  if not app.fs.isDirectory(full_dir) then
-    app.fs.makeAllDirectories(full_dir)
-  end
+  local full_dir, res_dir = godot_target(godot_path, base.optional_string(params, "target_dir", "assets/sprites"))
+  opts.output_dir = full_dir
+  opts.name = base.optional_string(params, "name", nil) or godot_export.default_name(sprite)
+  -- Pass the correct res:// texture path so the .tres references it directly.
+  opts.texture_path = res_dir .. opts.name .. ".png"
 
-  -- Pass the correct res:// texture path so export_for_godot writes the .tres
-  -- with the right reference directly (no second overwrite needed).
-  local res_texture = "res://" .. target_dir .. "/" .. name .. ".png"
-  local result = godot_cmds.export_for_godot({
-    output_dir = full_dir,
-    name = name,
-    scale = scale,
-    texture_path = res_texture,
-  })
-
-  if result.result then
-    result.result.tres_texture_path = res_texture
-  end
-
-  return result
+  local result, werr = godot_export.write(sprite, opts)
+  if werr then return werr end
+  result.tres_texture_path = opts.texture_path
+  return base.success(result)
 end
 
 function godot_cmds.batch_export_for_godot(params)
   local godot_path, e1 = base.require_string(params, "godot_project_path")
   if e1 then return e1 end
 
-  local target_dir = base.optional_string(params, "target_dir", "assets/sprites")
-  local scale = base.optional_number(params, "scale", 1)
-  local full_dir = app.fs.joinPath(godot_path, target_dir)
+  local opts, oerr = godot_export.parse_options(params)
+  if oerr then return oerr end
+
+  local full_dir, res_dir = godot_target(godot_path, base.optional_string(params, "target_dir", "assets/sprites"))
   if not app.fs.isDirectory(full_dir) then
     app.fs.makeAllDirectories(full_dir)
   end
@@ -4029,8 +4634,7 @@ function godot_cmds.batch_export_for_godot(params)
   local used_names = {}
   local exported = {}
   for si, sprite in ipairs(app.sprites) do
-    app.sprite = sprite
-    local base_name = sprite.filename:match("([^/\\]+)%.%w+$")
+    local base_name = sprite.filename:match("([^/\\]+)%.[^./\\]+$")
     if not base_name or base_name == "" then
       base_name = "sprite" .. si
     end
@@ -4042,15 +4646,19 @@ function godot_cmds.batch_export_for_godot(params)
     end
     used_names[name] = true
 
-    local result = godot_cmds.export_for_godot({
-      output_dir = full_dir,
-      name = name,
-      scale = scale,
-    })
+    local o = {}
+    for k, v in pairs(opts) do o[k] = v end
+    o.output_dir = full_dir
+    o.name = name
+    o.texture_path = res_dir .. name .. ".png"
+    local result, werr = godot_export.write(sprite, o)
     exported[#exported + 1] = {
       sprite = sprite.filename,
       name = name,
-      success = result.result ~= nil,
+      success = result ~= nil,
+      tres_path = result and result.tres_path or nil,
+      png_path = result and result.png_path or nil,
+      error = werr and werr.error and werr.error.message or nil,
     }
   end
 
@@ -5682,6 +6290,432 @@ function advanced_cmds.copy_between_sprites(params)
 end
 
 ----------------------------------------------------------------------
+-- Godot auto-sync on save (Aseprite 1.3.18.2+ / API 41: sprite 'save' event)
+-- Configuration is persisted in plugin.preferences.autosync as a LIST of
+-- entries (Aseprite writes preference table keys unescaped, so absolute
+-- Windows paths must never be used as keys — they are stored as values).
+----------------------------------------------------------------------
+local AUTOSYNC_MIN_API = 41
+
+autosync.suppress = autosync.suppress or 0
+autosync.attached = {}   -- [sprite.id] = { sprite = Sprite, listener = id, path = string }
+autosync.last = {}       -- [normalized path] = last run status
+autosync.running = false
+autosync.site_listener = nil
+
+function autosync.supported()
+  return (app.apiVersion or 0) >= AUTOSYNC_MIN_API
+end
+
+function autosync.unsupported_error()
+  return base.error(-32001,
+    "Godot auto-sync requires Aseprite 1.3.18.2 or newer (scripting API 41, sprite 'save' event). " ..
+    "This Aseprite is " .. tostring(app.version) .. " (API " .. tostring(app.apiVersion) .. ").",
+    { suggestion = "Update Aseprite, or call export_for_godot / sync_to_godot_project after saving" })
+end
+
+-- Comparison key for a path (case-insensitive on Windows).
+function autosync.key(path)
+  if not path or path == "" then return nil end
+  local p = app.fs.normalizePath(path)
+  if app.fs.pathSeparator == "\\" then p = p:lower() end
+  return p
+end
+
+function autosync.same_path(a, b)
+  local ka, kb = autosync.key(a), autosync.key(b)
+  return ka ~= nil and ka == kb
+end
+
+function autosync.entries()
+  if not plugin_ref then return {} end
+  local prefs = plugin_ref.preferences
+  if type(prefs.autosync) ~= "table" then prefs.autosync = {} end
+  return prefs.autosync
+end
+
+function autosync.find(path)
+  local k = autosync.key(path)
+  if not k then return nil, nil end
+  for i, e in ipairs(autosync.entries()) do
+    if autosync.key(e.path) == k then return i, e end
+  end
+  return nil, nil
+end
+
+-- A sprite counts as file-backed only when its filename is an absolute path
+-- to an existing file (new sprites are just "Sprite").
+function autosync.is_file_backed(sprite)
+  local fn = sprite and sprite.filename
+  return fn ~= nil and fn ~= "" and app.fs.isFile(fn)
+end
+
+-- Run the export for one entry. Never saves the source sprite.
+function autosync.run(sprite, entry, reason)
+  if autosync.running then
+    return { ok = false, error = "auto-sync already running" }
+  end
+  autosync.running = true
+  local status
+  local ok, perr = pcall(function()
+    local opts, oerr = godot_export.parse_options(entry)
+    if oerr then
+      status = { ok = false, error = oerr.error.message }
+      return
+    end
+    local target = entry.target_dir or "assets/sprites"
+    target = target:gsub("\\", "/"):gsub("^/+", ""):gsub("/+$", "")
+    local name = entry.name
+    if not name or name == "" then name = godot_export.default_name(sprite) end
+    opts.output_dir = app.fs.normalizePath(app.fs.joinPath(entry.godot_project_path, target))
+    opts.name = name
+    opts.texture_path = entry.texture_path
+    if not opts.texture_path or opts.texture_path == "" then
+      opts.texture_path = ((target == "") and "res://" or ("res://" .. target .. "/")) .. name .. ".png"
+    end
+    opts.write_json = entry.write_json == true
+    local result, werr = godot_export.write(sprite, opts)
+    if werr then
+      status = { ok = false, error = werr.error and werr.error.message or "export failed" }
+    else
+      status = { ok = true, tres_path = result.tres_path, png_path = result.png_path,
+                 texture_res_path = result.texture_res_path, animations = result.animations }
+    end
+  end)
+  autosync.running = false
+  if not ok then status = { ok = false, error = tostring(perr) } end
+  status.reason = reason
+  status.time = os.date("%Y-%m-%d %H:%M:%S")
+  autosync.last[autosync.key(entry.path)] = status
+  if status.ok then
+    log("Auto-sync (" .. tostring(reason) .. "): " .. tostring(status.tres_path))
+  else
+    log("Auto-sync failed (" .. tostring(reason) .. "): " .. tostring(status.error))
+  end
+  return status
+end
+
+-- Called after the sprite's own file was written (by save_sprite, or by the
+-- 'save' event for user saves). Returns the run status or nil when the
+-- sprite has no auto-sync configuration.
+function autosync.after_save(sprite, reason)
+  if not autosync.supported() then return nil end
+  local okf, fn = pcall(function() return sprite.filename end)
+  if not okf then return nil end
+  local _, entry = autosync.find(fn)
+  if not entry or entry.enabled == false then return nil end
+  return autosync.run(sprite, entry, reason)
+end
+
+function autosync.detach(sprite_id)
+  local a = autosync.attached[sprite_id]
+  if not a then return end
+  pcall(function() a.sprite.events:off(a.listener) end)
+  autosync.attached[sprite_id] = nil
+end
+
+function autosync.attach(sprite)
+  if not autosync.supported() then return false end
+  local ok, sid = pcall(function() return sprite.id end)
+  if not ok or sid == nil then return false end
+  if autosync.attached[sid] then return true end
+  local listener
+  local okl, lerr = pcall(function()
+    listener = sprite.events:on("save", function()
+      if (autosync.suppress or 0) > 0 then return end
+      autosync.after_save(sprite, "save_event")
+    end)
+  end)
+  if not okl then
+    log("Auto-sync: could not subscribe to sprite save event: " .. tostring(lerr))
+    return false
+  end
+  autosync.attached[sid] = { sprite = sprite, listener = listener, path = sprite.filename }
+  log("Auto-sync attached: " .. tostring(sprite.filename))
+  return true
+end
+
+-- Attach to every open sprite that has a configuration; forget sprites that
+-- were closed (their event objects are destroyed with the document).
+function autosync.scan()
+  if not autosync.supported() or not plugin_ref then return end
+  local live = {}
+  for _, s in ipairs(app.sprites) do
+    local ok, sid = pcall(function() return s.id end)
+    if ok and sid ~= nil then
+      live[sid] = true
+      if not autosync.attached[sid] then
+        local _, entry = autosync.find(s.filename)
+        if entry and entry.enabled ~= false then autosync.attach(s) end
+      end
+    end
+  end
+  for sid, _ in pairs(autosync.attached) do
+    if not live[sid] then autosync.attached[sid] = nil end
+  end
+end
+
+function autosync.start()
+  if not autosync.supported() then
+    log("Auto-sync unavailable (needs API " .. AUTOSYNC_MIN_API .. ", have " .. tostring(app.apiVersion) .. ")")
+    return
+  end
+  if autosync.site_listener == nil then
+    local ok, id = pcall(function()
+      return app.events:on("sitechange", function() autosync.scan() end)
+    end)
+    if ok then autosync.site_listener = id end
+  end
+  autosync.scan()
+end
+
+function autosync.stop()
+  for sid, _ in pairs(autosync.attached) do autosync.detach(sid) end
+  if autosync.site_listener ~= nil then
+    pcall(function() app.events:off(autosync.site_listener) end)
+    autosync.site_listener = nil
+  end
+end
+
+-- Resolve the sprite an auto-sync command targets: id / filename of an open
+-- sprite, else the active sprite.
+local function autosync_target_sprite(params)
+  if params.id ~= nil or (type(params.filename) == "string" and params.filename ~= "") then
+    return base.resolve_sprite(params)
+  end
+  return base.get_sprite()
+end
+
+function godot_cmds.enable_godot_autosync(params)
+  if not autosync.supported() then return autosync.unsupported_error() end
+  local sprite, err = autosync_target_sprite(params)
+  if err then return err end
+  if not autosync.is_file_backed(sprite) then
+    return base.error(-32001,
+      "The sprite must be saved to a file first (auto-sync is keyed by its file path)",
+      { suggestion = "Call save_sprite with path=<file>.aseprite and rename=true" })
+  end
+  local godot_path, e1 = base.require_string(params, "godot_project_path")
+  if e1 then return e1 end
+  if not app.fs.isDirectory(godot_path) then
+    return base.error(-32001, "godot_project_path is not a directory: " .. godot_path)
+  end
+  local opts, oerr = godot_export.parse_options(params)
+  if oerr then return oerr end
+
+  local path = app.fs.normalizePath(sprite.filename)
+  local entry = {
+    path = path,
+    godot_project_path = app.fs.normalizePath(godot_path),
+    target_dir = base.optional_string(params, "target_dir", "assets/sprites"),
+    name = base.optional_string(params, "name", nil),
+    texture_path = base.optional_string(params, "texture_path", nil),
+    sheet_type = opts.sheet_type,
+    columns = opts.columns,
+    rows = opts.rows,
+    scale = opts.scale,
+    trim = opts.trim,
+    write_json = base.optional_bool(params, "write_json", false),
+    enabled = true,
+  }
+  local list = autosync.entries()
+  local idx = autosync.find(path)
+  if idx then list[idx] = entry else list[#list + 1] = entry end
+  -- Reassigning the table marks the preferences dirty for serialization.
+  plugin_ref.preferences.autosync = list
+
+  autosync.attach(sprite)
+
+  local run = nil
+  if base.optional_bool(params, "run_now", true) then
+    run = autosync.run(sprite, entry, "enable")
+  end
+  return base.success({
+    enabled = true,
+    path = path,
+    config = entry,
+    attached = autosync.attached[sprite.id] ~= nil,
+    initial_export = run,
+  })
+end
+
+function godot_cmds.disable_godot_autosync(params)
+  local path = base.optional_string(params, "path", nil)
+  if not path then
+    local sprite, err = autosync_target_sprite(params)
+    if err then return err end
+    path = sprite.filename
+  end
+  local idx, entry = autosync.find(path)
+  if not idx then
+    return base.error(-32001, "No Godot auto-sync is configured for: " .. tostring(path))
+  end
+  local list = autosync.entries()
+  table.remove(list, idx)
+  plugin_ref.preferences.autosync = list
+  for sid, a in pairs(autosync.attached) do
+    if autosync.same_path(a.path, entry.path) then autosync.detach(sid) end
+  end
+  autosync.last[autosync.key(entry.path)] = nil
+  return base.success({ disabled = true, path = entry.path, remaining = #list })
+end
+
+function godot_cmds.get_godot_autosync_status(params)
+  local out = {}
+  for _, e in ipairs(autosync.entries()) do
+    local open, attached = false, false
+    for _, s in ipairs(app.sprites) do
+      if autosync.same_path(s.filename, e.path) then
+        open = true
+        attached = autosync.attached[s.id] ~= nil
+        break
+      end
+    end
+    out[#out + 1] = {
+      path = e.path,
+      godot_project_path = e.godot_project_path,
+      target_dir = e.target_dir,
+      name = e.name,
+      texture_path = e.texture_path,
+      sheet_type = e.sheet_type,
+      columns = e.columns,
+      rows = e.rows,
+      scale = e.scale,
+      trim = e.trim,
+      write_json = e.write_json,
+      enabled = e.enabled ~= false,
+      file_exists = app.fs.isFile(e.path),
+      open = open,
+      attached = attached,
+      last_run = autosync.last[autosync.key(e.path)],
+    }
+  end
+  return base.success({
+    supported = autosync.supported(),
+    required = "Aseprite 1.3.18.2+ (API 41)",
+    api_version = app.apiVersion,
+    entries = out,
+    count = #out,
+  })
+end
+
+----------------------------------------------------------------------
+-- "Godot SpriteFrames" custom file format (Aseprite 1.3.18+ / API 40)
+-- File > Export As... > "<name>.spriteframes" writes, next to it:
+--   <name>.tres  Godot SpriteFrames resource (texture path auto-detected from
+--                the enclosing Godot project, else relative to the .tres)
+--   <name>.png   the sprite sheet atlas
+-- and the .spriteframes file itself as a small JSON manifest of that export.
+-- Aseprite matches formats by the text after the LAST dot only, so a
+-- ".spriteframes.tres" double extension can never match, and claiming ".tres"
+-- would hijack a generic Godot resource extension (TileSet, materials, ...)
+-- for every Aseprite open/save dialog and clash with other extensions. A
+-- distinct extension is the safe choice.
+----------------------------------------------------------------------
+local file_format = { registered = false, error = nil, extension = "spriteframes" }
+
+-- FILE_SUPPORT_TAGS (0x1000) is not exposed through the Lua FormatSupport
+-- table; declaring it avoids a "format doesn't support tags" warning dialog.
+local FILE_SUPPORT_TAGS_FLAG = 0x1000
+
+function file_format.onsave(ev)
+  local sprite = ev.sprite
+  if not sprite then error("No sprite to export") end
+  local out_dir = app.fs.filePath(ev.filename)
+  local name = app.fs.fileTitle(ev.filename)
+  local opts = godot_export.parse_options({})
+  opts.output_dir = out_dir
+  opts.name = name
+  opts.write_json = false
+  opts.texture_fallback = "relative"
+  local result, werr = godot_export.write(sprite, opts)
+  if werr then
+    error("Godot SpriteFrames export failed: " .. tostring(werr.error and werr.error.message))
+  end
+  local manifest = {
+    generator = "Aseprite MCP Pro " .. VERSION,
+    format = "Godot SpriteFrames",
+    source = sprite.filename,
+    tres_path = result.tres_path,
+    png_path = result.png_path,
+    texture_res_path = result.texture_res_path,
+    animations = result.animations,
+    frames = result.total_frames,
+  }
+  local ok_json, encoded = pcall(function() return json.encode(manifest) end)
+  ev.file:write(ok_json and encoded or "{}")
+  log("Godot SpriteFrames export: " .. tostring(result.tres_path))
+  file_format.keep_unsaved_mark(sprite)
+  return true
+end
+
+-- Aseprite marks the document as saved after ANY successful custom-format
+-- save, including File > Export / saveCopyAs. For an export that would drop
+-- the "unsaved changes" mark of the .aseprite and let the user close it
+-- without the save prompt. Restore the mark right after the save completes
+-- with a tiny undoable no-op (re-assigning sprite.data).
+function file_format.keep_unsaved_mark(sprite)
+  local ok, was_modified = pcall(function() return sprite.isModified end)
+  if not ok or not was_modified or not app.isUIAvailable then return end
+  local t
+  t = Timer {
+    interval = 0.01,
+    ontick = function()
+      t:stop()
+      pcall(function()
+        if sprite.isModified then return end
+        local fn = sprite.filename or ""
+        if fn:lower():sub(-(#file_format.extension + 1)) == "." .. file_format.extension then
+          return -- a real Save As to .spriteframes: the saved state is correct
+        end
+        app.transaction("Keep Unsaved Changes Mark", function()
+          sprite.data = sprite.data
+        end)
+      end)
+    end,
+  }
+  t:start()
+end
+
+function file_format.onload(ev)
+  error("Importing Godot SpriteFrames into Aseprite is not supported. " ..
+    "The .spriteframes file is an export manifest; open the original .aseprite file instead.")
+end
+
+function file_format.register(plugin)
+  if (app.apiVersion or 0) < 40 then
+    file_format.error = "requires Aseprite 1.3.18+ (API 40)"
+    return false
+  end
+  local okf, nf = pcall(function() return plugin.newFileFormat end)
+  if not okf or not nf then
+    file_format.error = "plugin:newFileFormat not available"
+    return false
+  end
+  local supports = FormatSupport.RGB | FormatSupport.RGBA | FormatSupport.GRAY |
+    FormatSupport.GRAYA | FormatSupport.INDEXED | FormatSupport.LAYER |
+    FormatSupport.FRAME | FormatSupport.PALETTE | FILE_SUPPORT_TAGS_FLAG
+  if FormatSupport.PALETTE_ALPHA then supports = supports | FormatSupport.PALETTE_ALPHA end
+  local ok, rerr = pcall(function()
+    plugin:newFileFormat {
+      name = "Godot SpriteFrames",
+      extensions = { file_format.extension },
+      binary = false,
+      supports = supports,
+      onload = file_format.onload,
+      onsave = file_format.onsave,
+    }
+  end)
+  if not ok then
+    file_format.error = tostring(rerr)
+    log("Godot SpriteFrames format not registered: " .. tostring(rerr))
+    return false
+  end
+  file_format.registered = true
+  return true
+end
+
+----------------------------------------------------------------------
 -- Register all commands into handlers table
 ----------------------------------------------------------------------
 local function load_commands()
@@ -5762,6 +6796,7 @@ local function load_commands()
   handlers["save_palette"] = palette_cmds.save_palette
   handlers["set_fg_color"] = palette_cmds.set_fg_color
   handlers["set_bg_color"] = palette_cmds.set_bg_color
+  handlers["pick_color"] = palette_cmds.pick_color
   handlers["generate_palette_from_sprite"] = palette_cmds.generate_palette_from_sprite
   handlers["sort_palette"] = palette_cmds.sort_palette
   handlers["import_palette_from_image"] = palette_cmds.import_palette_from_image
@@ -5787,6 +6822,8 @@ local function load_commands()
   handlers["set_tile"] = tilemap_cmds.set_tile
   handlers["get_tile"] = tilemap_cmds.get_tile
   handlers["get_tilemap_info"] = tilemap_cmds.get_tilemap_info
+  handlers["copy_tiles"] = tilemap_cmds.copy_tiles
+  handlers["fill_tiles"] = tilemap_cmds.fill_tiles
 
   -- Export commands
   handlers["export_png"] = export_cmds.export_png
@@ -5805,6 +6842,9 @@ local function load_commands()
   handlers["generate_spriteframes_tres"] = godot_cmds.generate_spriteframes_tres
   handlers["sync_to_godot_project"] = godot_cmds.sync_to_godot_project
   handlers["batch_export_for_godot"] = godot_cmds.batch_export_for_godot
+  handlers["enable_godot_autosync"] = godot_cmds.enable_godot_autosync
+  handlers["disable_godot_autosync"] = godot_cmds.disable_godot_autosync
+  handlers["get_godot_autosync_status"] = godot_cmds.get_godot_autosync_status
 
   -- Analysis commands
   handlers["get_color_stats"] = analysis_cmds.get_color_stats
@@ -5841,7 +6881,7 @@ local function load_commands()
 
   local total = 0
   for _ in pairs(handlers) do total = total + 1 end
-  print("[MCP] Total commands registered: " .. total)
+  log("Total commands registered: " .. total)
 end
 
 ----------------------------------------------------------------------
@@ -5870,6 +6910,17 @@ local function dispatch(method, params)
       api_version = app.apiVersion,
       ui_available = app.isUIAvailable,
       port = port,
+      connected = connected,
+      verbose_logging = verbose_logging,
+      recent_log = recent_log(),
+      features = {
+        godot_autosync = autosync.supported(),            -- API 41 (1.3.18.2+)
+        godot_spriteframes_format = file_format.registered, -- API 40 (1.3.18+)
+        godot_spriteframes_format_error = file_format.error,
+        godot_spriteframes_extension = file_format.extension,
+        eyedropper_use_tool = (app.apiVersion or 0) >= 40,
+      },
+      autosync_entries = #autosync.entries(),
     } }
   end
 
@@ -5902,7 +6953,7 @@ end
 local function on_message(msg_data)
   local ok, request = pcall(json.decode, msg_data)
   if not ok or not request then
-    print("[MCP] Failed to parse JSON: " .. tostring(msg_data):sub(1, 100))
+    log("Failed to parse JSON: " .. tostring(msg_data):sub(1, 100))
     return
   end
 
@@ -5920,7 +6971,7 @@ local function on_message(msg_data)
     if ok2 and ws then
       ws:sendText(encoded)
     else
-      print("[MCP] Failed to encode response: " .. tostring(encoded))
+      log("Failed to encode response: " .. tostring(encoded))
     end
   elseif response and response.method == "pong" then
     local ok2, encoded = pcall(json.encode, { jsonrpc = "2.0", method = "pong" })
@@ -5959,8 +7010,17 @@ local stale_retries = 0
 local sticky_port = nil
 local sticky_fails = 0
 local connect_failed = false
+-- Aseprite 1.3.19+ (beta, PR aseprite#5965) gates WebSocket creation behind a
+-- per-extension "network" permission prompt. The prompt is modal and runs a
+-- nested UI loop, so timers keep ticking while it is open: never start a
+-- second connect while one is still waiting for the user, and if the user
+-- denies access stop auto-reconnecting (re-prompting every 3 s would make
+-- Aseprite unusable) until they pick Help > MCP Pro: Reconnect.
+local connecting = false
+local network_denied = false
 
 local function connect()
+  if connecting then return end
   -- Destroy old connection completely
   if ws then
     pcall(function() ws:close() end)
@@ -5973,49 +7033,72 @@ local function connect()
   local opened = false
 
   local url = "ws://127.0.0.1:" .. port
-  print("[MCP] Connecting to " .. url .. "...")
+  log("Connecting to " .. url .. "...")
 
   local sock
-  sock = WebSocket {
-    url = url,
-    deflate = false,
-    onreceive = function(mt, data, err)
-      if my_gen ~= generation then
-        -- Event from a socket that has already been superseded; ignore it and
-        -- make sure it is fully closed.
-        pcall(function() sock:close() end)
-        return
-      end
-      last_activity = os.time()
-      if mt == WebSocketMessageType.OPEN then
-        connected = true
-        opened = true
-        stale_retries = 0
-        sticky_port = port
-        sticky_fails = 0
-        print("[MCP] Connected to MCP server")
-      elseif mt == WebSocketMessageType.TEXT then
-        on_message(data)
-      elseif mt == WebSocketMessageType.CLOSE then
-        connected = false
-        print("[MCP] Disconnected from MCP server")
-        pcall(function() sock:close() end)
-        if ws == sock then ws = nil end
-      elseif mt == WebSocketMessageType.ERROR then
-        connected = false
-        if not opened then
-          -- Connect attempt failed (e.g. ECONNREFUSED): let the health check
-          -- decide whether to rotate to the next port.
-          connect_failed = true
+  connecting = true
+  local ok_ws, ws_err = pcall(function()
+    sock = WebSocket {
+      url = url,
+      deflate = false,
+      onreceive = function(mt, data, err)
+        if my_gen ~= generation then
+          -- Event from a socket that has already been superseded; ignore it and
+          -- make sure it is fully closed.
+          pcall(function() sock:close() end)
+          return
         end
-        print("[MCP] WebSocket error: " .. tostring(err))
-        pcall(function() sock:close() end)
-        if ws == sock then ws = nil end
+        last_activity = os.time()
+        if mt == WebSocketMessageType.OPEN then
+          connected = true
+          opened = true
+          stale_retries = 0
+          sticky_port = port
+          sticky_fails = 0
+          log("Connected to MCP server")
+        elseif mt == WebSocketMessageType.TEXT then
+          on_message(data)
+        elseif mt == WebSocketMessageType.CLOSE then
+          connected = false
+          log("Disconnected from MCP server")
+          pcall(function() sock:close() end)
+          if ws == sock then ws = nil end
+        elseif mt == WebSocketMessageType.ERROR then
+          connected = false
+          if not opened then
+            -- Connect attempt failed (e.g. ECONNREFUSED): let the health check
+            -- decide whether to rotate to the next port.
+            connect_failed = true
+          end
+          log("WebSocket error: " .. tostring(err))
+          pcall(function() sock:close() end)
+          if ws == sock then ws = nil end
+        end
       end
+    }
+  end)
+  connecting = false
+  if not ok_ws or not sock then
+    ws = nil
+    local msg = tostring(ws_err)
+    if msg:find("permission") then
+      network_denied = true
+      log("Network access denied for the extension; auto-connect paused. " ..
+        "Use Help > MCP Pro: Reconnect to be asked again (" .. msg .. ")")
+    else
+      connect_failed = true
+      log("Could not create WebSocket: " .. msg)
     end
-  }
+    return
+  end
+  network_denied = false
   ws = sock
-  sock:connect()
+  local ok_c, c_err = pcall(function() sock:connect() end)
+  if not ok_c then
+    log("WebSocket connect failed: " .. tostring(c_err))
+    ws = nil
+    connect_failed = true
+  end
 end
 
 ----------------------------------------------------------------------
@@ -6030,6 +7113,7 @@ local function start_health_check()
   health_timer = Timer {
     interval = RECONNECT_INTERVAL_MS / 1000.0,
     ontick = function()
+      if network_denied or connecting then return end
       local now = os.time()
       local stale = (now - last_activity) > STALE_SECONDS
       if connected then
@@ -6043,11 +7127,11 @@ local function start_health_check()
         if stale then
           stale_retries = stale_retries + 1
           if stale_retries >= 3 then
-            print("[MCP] Connection stale repeatedly, trying next port")
+            log("Connection stale repeatedly, trying next port")
             advance_port()
             stale_retries = 0
           else
-            print("[MCP] Connection stale, reconnecting (same port)")
+            log("Connection stale, reconnecting (same port)")
           end
           if ws then pcall(function() ws:close() end) end
           ws = nil
@@ -6076,7 +7160,7 @@ local function start_health_check()
         -- hangs instead of erroring). Apply the same stickiness as the error
         -- path: hunt freely until the first session, then prefer the port that
         -- last carried one.
-        print("[MCP] Connect attempt stalled")
+        log("Connect attempt stalled")
         pcall(function() ws:close() end)
         ws = nil
         if sticky_port == nil or port ~= sticky_port then
@@ -6099,7 +7183,9 @@ end
 -- Plugin lifecycle
 ----------------------------------------------------------------------
 function init(plugin)
-  print("[MCP] Aseprite MCP Pro v" .. VERSION .. " initializing...")
+  plugin_ref = plugin
+  verbose_logging = (plugin.preferences and plugin.preferences.verbose_logging == true) or false
+  log("Aseprite MCP Pro v" .. VERSION .. " initializing...")
 
   if plugin.preferences and plugin.preferences.port then
     port = plugin.preferences.port
@@ -6112,16 +7198,17 @@ function init(plugin)
 
   load_commands()
 
-  -- Initial connection + start persistent health check
-  connect()
-  start_health_check()
+  -- Optional Aseprite 1.3.18+ integrations (feature-detected).
+  file_format.register(plugin)
+  autosync.start()
 
   plugin:newCommand {
     id = "mcp_reconnect",
     title = "MCP Pro: Reconnect",
     group = "help_about",
     onclick = function()
-      print("[MCP] Manual reconnect requested")
+      log("Manual reconnect requested")
+      network_denied = false
       connect()
     end,
   }
@@ -6132,16 +7219,29 @@ function init(plugin)
     group = "help_about",
     onclick = function()
       local status = connected and "Connected" or "Disconnected"
-      app.alert {
-        title = "Aseprite MCP Pro",
-        text = {
-          "Version: " .. VERSION,
-          "Status: " .. status,
-          "Port: " .. port,
-          "Commands: " .. count_keys(handlers),
-          "Aseprite: " .. tostring(app.version) .. " (API " .. tostring(app.apiVersion) .. ")",
-        },
-      }
+      local dlg = Dialog("Aseprite MCP Pro")
+      dlg:label { label = "Version:", text = VERSION }
+      dlg:newrow()
+      dlg:label { label = "Status:", text = network_denied and "Network access denied (use MCP Pro: Reconnect)" or status }
+      dlg:newrow()
+      dlg:label { label = "Port:", text = tostring(port) }
+      dlg:newrow()
+      dlg:label { label = "Commands:", text = tostring(count_keys(handlers)) }
+      dlg:newrow()
+      dlg:label { label = "Aseprite:", text = tostring(app.version) .. " (API " .. tostring(app.apiVersion) .. ")" }
+      dlg:newrow()
+      dlg:label { label = "Godot auto-sync:", text = autosync.supported() and
+        (tostring(#autosync.entries()) .. " configured") or "needs Aseprite 1.3.18.2+" }
+      dlg:newrow()
+      dlg:label { label = "Last log:", text = log_lines[#log_lines] or "-" }
+      dlg:button { id = "showlog", text = "Show Log",
+        onclick = function()
+          -- Printing is fine here: the user explicitly asked to see the log.
+          print("---- Aseprite MCP Pro: recent log ----")
+          for _, l in ipairs(log_lines) do print(l) end
+        end }
+      dlg:button { id = "close", text = "Close" }
+      dlg:show()
     end,
   }
 
@@ -6152,22 +7252,50 @@ function init(plugin)
     onclick = function()
       local dlg = Dialog("MCP Pro Settings")
       dlg:number { id = "port", label = "Server Port:", text = tostring(port) }
+      dlg:check { id = "verbose", label = "Logging:", text = "Verbose (echo log to the Console window)",
+        selected = verbose_logging }
       dlg:button { id = "ok", text = "Save" }
       dlg:button { id = "cancel", text = "Cancel" }
       dlg:show()
 
       if dlg.data.ok then
-        port = math.floor(dlg.data.port)
-        plugin.preferences.port = port
-        print("[MCP] Port changed to " .. port .. ". Reconnecting...")
-        connect()
+        verbose_logging = dlg.data.verbose and true or false
+        plugin.preferences.verbose_logging = verbose_logging
+        local new_port = math.floor(dlg.data.port)
+        if new_port ~= port then
+          port = new_port
+          plugin.preferences.port = port
+          log("Port changed to " .. port .. ". Reconnecting...")
+          connect()
+        end
       end
     end,
   }
+
+  -- Connect only when there is a UI: in CLI/batch mode (e.g.
+  -- "aseprite -b x.aseprite --save-as x.spriteframes") the event loop never
+  -- runs, so a socket could only kick the GUI instance off the MCP server.
+  -- The first connect is deferred out of init() so the menu commands above
+  -- exist even if a permission prompt (Aseprite 1.3.19+) is denied.
+  if app.isUIAvailable then
+    start_health_check()
+    local first
+    first = Timer {
+      interval = 0.1,
+      ontick = function()
+        first:stop()
+        if not ws then connect() end
+      end,
+    }
+    first:start()
+  else
+    log("No UI (batch mode): not connecting to the MCP server")
+  end
 end
 
 function exit(plugin)
-  print("[MCP] Aseprite MCP Pro shutting down...")
+  log("Aseprite MCP Pro shutting down...")
+  autosync.stop()
   if health_timer then
     health_timer:stop()
     health_timer = nil

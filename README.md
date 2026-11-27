@@ -2,7 +2,7 @@
 
 AI-powered pixel art creation with Aseprite via the Model Context Protocol.
 
-**96 tools** for complete control over sprites, layers, animations, palettes, and export — with built-in Godot Engine integration.
+**129 tools** for complete control over sprites, layers, animations, palettes, and export — with built-in Godot Engine integration.
 
 ## What is Aseprite MCP Pro?
 
@@ -67,7 +67,7 @@ Works alongside [Godot MCP Pro](https://godot-mcp.abyo.net/) for a complete AI-d
 
 ## Related Projects
 
-- [Godot MCP Pro](https://godot-mcp.abyo.net/) — AI-powered Godot development (163 tools)
+- [Godot MCP Pro](https://godot-mcp.abyo.net/) — AI-powered Godot development (190 tools)
 - [Tiled MCP Pro](https://tiled-mcp-pro.abyo.net/) — AI-powered tile map editing (122 tools)
 
 ## License

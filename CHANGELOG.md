@@ -1,5 +1,43 @@
 # Changelog
 
+## v1.3.0 (2026-11-27)
+
+Aseprite 1.3.18 integration release: Godot auto-sync on save, a native "Godot SpriteFrames" export format, an eyedropper tool and tile-rect tools — plus fixes to the Godot exporters and the end of the Console window popping up on every connect. **129 tools** (66 in `--lite` mode). Tested live against Aseprite 1.3.18.6; generated resources verified loading in Godot 4.6.2. Every new Aseprite API is feature-detected, so older Aseprite 1.3.x keeps working.
+
+### Added
+- **Godot auto-sync on save** — `enable_godot_autosync`, `disable_godot_autosync`, `get_godot_autosync_status`. After every save of a `.aseprite` file (Ctrl+S in Aseprite, or `save_sprite`), the extension re-exports the sheet PNG + SpriteFrames `.tres` into `<godot_project_path>/<target_dir>` with the same options as `sync_to_godot_project`. The configuration is persisted per file path in the extension preferences and re-attaches when the file is reopened (also after restarting Aseprite). The export never re-saves the source sprite. **Requires Aseprite 1.3.18.2+** (API 41, sprite `save` event); older versions get a clear error.
+- **"Godot SpriteFrames" file format** — File › Export As… `name.spriteframes` (or `aseprite -b x.aseprite --save-as x.spriteframes`) writes `name.tres` + `name.png` next to it, plus a small JSON manifest in the `.spriteframes` file. The texture path is `res://…` when a `project.godot` is found above the folder, else relative to the `.tres` (Godot resolves it). Opening a `.spriteframes` file reports "import not supported". A dedicated extension is used because Aseprite matches only the last extension (so `.spriteframes.tres` cannot work) and claiming `.tres` would hijack a generic Godot resource extension. **Requires Aseprite 1.3.18+** (API 40, `plugin:newFileFormat`); not registered on older versions.
+- **`pick_color`** — samples the composited sprite (all visible layers) at x,y on any frame, returning `#RRGGBBAA`, and can set the result as FG or BG (left untouched by default). Uses the native `app.useTool{ tool="eyedropper" }` on **Aseprite 1.3.18+**, and an equivalent Lua composite on older versions (`method: "composite"` forces it).
+- **`fill_tiles`** — fills a tile rectangle with a tile index (optional x/y/diagonal flip flags); creates or grows the tilemap cel (also left/up) and appends empty tiles if the index does not exist yet.
+- **`copy_tiles`** — copies a tile rectangle (indices + flip flags) to another tilemap layer, frame or position. Same tileset: copied as-is; different tilesets: each tile is remapped to an identical tile image in the destination, missing ones are appended (`add_missing_tiles`, default true) and reported. Overlapping areas are safe; one undo step. Works on Aseprite 1.3+ (it does not use the clipboard, whose tilemap copy/paste between layers Aseprite fixed in 1.3.18.4–1.3.18.6).
+- `get_server_info` now also returns `recent_log`, `connected`, `verbose_logging`, `autosync_entries` and a `features` map (which 1.3.18 integrations are active on this Aseprite).
+- Godot exporters gain `columns` / `rows` (and `get_animation_data` / `generate_spriteframes_tres` / `sync_to_godot_project` / `batch_export_for_godot` gain `scale` / `trim`), all sharing one code path.
+
+### Fixed
+- **Console window popping up over the canvas**: the extension `print()`ed on every connect attempt, reconnect and stale cycle, which opens Aseprite's Console for every user. All routine messages now go to a silent 50-line ring buffer (Help › MCP Pro: Status › Show Log, or `get_server_info.recent_log`). A new **Verbose** checkbox in Help › MCP Pro: Settings echoes them to the Console when wanted.
+- **`export_for_godot` ignored `scale` and `trim`** (read but never applied). Scale now resizes every frame (nearest neighbour) and the `.tres` regions are in scaled pixels; trim crops each frame to its opaque bounds and stores the offset in the AtlasTexture `margin`, so trimmed animations keep their exact placement in Godot (frames still report the full size).
+- **`sheet_type: "rows"` / `"columns"` silently fell back to horizontal** in `export_for_godot` (and `sync_to_godot_project` / `batch_export_for_godot` / `generate_spriteframes_tres` disagreed with each other about the layout). Both are implemented: `rows` = row-major grid with `columns` cells per row, `columns` = column-major grid with `rows` cells per column (default ceil(√frames)). Unknown values are rejected instead of falling back.
+- **Tag direction was lost in the SpriteFrames `.tres`** (Godot has no playback direction): reverse tags now list their frames in reverse; ping-pong tags append the reversed inner frames (a..b, b-1..a+1), ping-pong-reverse the mirror of that.
+- `batch_export_for_godot` / `export_for_godot` referenced the texture as `res://<name>.png` even inside a project subfolder; `batch_export_for_godot` now uses `res://<target_dir>/<name>.png`, and `export_for_godot` derives the `res://` path from the enclosing Godot project when `texture_path` is omitted.
+- `create_tilemap_layer` (and `add_layer(type:"tilemap")`) inherited the tile size of the active tilemap layer instead of the requested one.
+- Animation names containing `"` or `\` no longer break the generated `.tres`.
+
+### Fixed — newer Aseprite permission system (1.3.19 beta, aseprite#5965)
+- Tested on the Aseprite beta 1.3.18.6-195 (per-extension `permissions.json` prompts, curl-based WebSocket): all features pass once the permissions are granted.
+- Before this fix, denying the network prompt raised an error inside `init()`, so the MCP Pro menu commands were never registered. The first connect now runs after `init()`, and WebSocket creation is guarded. After a denial, auto-reconnect pauses (no re-prompt every 3 s, no port hunting) until Help › MCP Pro: Reconnect; the Status dialog shows the state.
+- No second connect is started while a permission prompt is still open (timers keep ticking under modal dialogs).
+- CLI/batch runs (e.g. `--save-as x.spriteframes`) no longer open a socket that could replace the GUI instance's MCP connection.
+- `open_sprite` on a missing file returns "File not found" instead of making Aseprite pop its Console.
+
+### Changed
+- The startup log line counts registered tools instead of printing a stale hard-coded number ("109 tools"); README / INSTALL / package descriptions now state 129 tools (66 lite).
+- `save_sprite` reports the auto-sync result (`autosync`) when the saved file has an auto-sync configuration, and returns an error instead of a Lua exception when the save fails.
+- MCP Pro: Settings only reconnects when the port actually changed.
+- Version 1.3.0 across `plugin.lua`, `extension/package.json` and the server. The extension manifest keeps `api: 27`, so Aseprite 1.3.x without the 1.3.18 APIs still loads it.
+
+### Known Aseprite behaviour
+- After a custom-format save Aseprite marks the document as saved, even for File › Export. The extension restores the "unsaved changes" mark right after a `.spriteframes` export (a tiny undoable no-op), so closing Aseprite still prompts to save the `.aseprite`.
+
 ## v1.2.2 (2026-07-21)
 
 Self-review pass over v1.2.1, plus a retry of the one deferred item — which turned out to already work.
